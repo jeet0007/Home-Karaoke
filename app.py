@@ -2,7 +2,9 @@
 
 import os
 import re
+import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -33,6 +35,34 @@ _PROXY_CHUNK_SIZE = 256 * 1024
 _PASSTHROUGH_RESPONSE_HEADERS = ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges")
 
 _http_client = httpx.Client(follow_redirects=True, timeout=20.0)
+
+
+def _resolve_host_port(env=None):
+    env = os.environ if env is None else env
+    host = env.get("APP_HOST", "127.0.0.1")
+    port_text = env.get("APP_PORT", "5000")
+
+    try:
+        port = int(port_text)
+    except ValueError as exc:
+        raise ValueError(f"Invalid APP_PORT={port_text!r}; set APP_PORT to a number from 1 to 65535") from exc
+
+    if port < 1 or port > 65535:
+        raise ValueError(f"Invalid APP_PORT={port}; set APP_PORT to a number from 1 to 65535")
+
+    return host, port
+
+
+def _assert_port_available(host, port):
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+        except OSError as exc:
+            raise RuntimeError(
+                f"Port {port} is already in use on {host} — set APP_PORT=<other port> and retry, or free the port"
+            ) from exc
 
 
 def _resolve_stream_urls(url, format_selector, timeout):
@@ -295,4 +325,12 @@ if __name__ == "__main__":
     # threaded=True: /stream-proxy holds a connection open per in-flight range
     # request (buffering + seeking issue several concurrently), which would
     # otherwise serialize behind the dev server's single worker thread.
-    app.run(host="127.0.0.1", port=5000, debug=True, threaded=True)
+    try:
+        app_host, app_port = _resolve_host_port()
+        if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+            _assert_port_available(app_host, app_port)
+    except (RuntimeError, ValueError) as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(1)
+
+    app.run(host=app_host, port=app_port, debug=True, threaded=True)
