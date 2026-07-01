@@ -85,6 +85,30 @@ class CheckLyricsAvailableTestCase(unittest.TestCase):
         _args, kwargs = mock_get.call_args
         self.assertEqual(kwargs["params"]["fast"], "false")
 
+    @patch("lyrica_client.httpx.get")
+    def test_sequence_requests_lyrica_pass_mode(self, mock_get):
+        # A `sequence` (e.g. "2" for LRCLIB - see fetch_controller.py
+        # FETCHER_MAP) requests Lyrica's pass=true&sequence=... mode,
+        # restricting the check to just that fetcher.
+        mock_get.return_value = _response(json_body={"status": "success", "data": {"plain_lyrics": "la la la"}})
+
+        lyrica_client.check_lyrics_available("Passenger", "Let Her Go", sequence="2")
+
+        _args, kwargs = mock_get.call_args
+        self.assertEqual(kwargs["params"]["pass"], "true")
+        self.assertEqual(kwargs["params"]["sequence"], "2")
+        self.assertNotIn("fast", kwargs["params"])
+
+    @patch("lyrica_client.httpx.get")
+    def test_sequence_takes_precedence_over_fast(self, mock_get):
+        mock_get.return_value = _response(json_body={"status": "success", "data": {"plain_lyrics": "la la la"}})
+
+        lyrica_client.check_lyrics_available("Passenger", "Let Her Go", fast=True, sequence="2")
+
+        _args, kwargs = mock_get.call_args
+        self.assertEqual(kwargs["params"]["sequence"], "2")
+        self.assertNotIn("fast", kwargs["params"])
+
 
 class FullLyricsFetchUsesFullChainTestCase(unittest.TestCase):
     """get_lyrics_full()/get_lyrics() are the post-selection fetch for the

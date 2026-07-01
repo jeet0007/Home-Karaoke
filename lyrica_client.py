@@ -28,7 +28,7 @@ class LyricaUnavailableError(Exception):
     """
 
 
-def check_lyrics_available(artist, title, timeout=TIMEOUT, fast=True):
+def check_lyrics_available(artist, title, timeout=TIMEOUT, fast=True, sequence=None):
     """Return True/False for whether Lyrica has lyrics for artist/title.
 
     Raises LyricaUnavailableError instead of returning False when we can't get
@@ -42,13 +42,25 @@ def check_lyrics_available(artist, title, timeout=TIMEOUT, fast=True):
     unpicked search candidates, where speed matters more than exhausting
     every source - see lyrics_filter.py. Callers doing a real one-shot lookup
     on a single confirmed song should pass fast=False.
+
+    `sequence` (default None), when given, requests Lyrica's
+    `pass=true&sequence=<fetcher ids>` mode instead of `fast=true`, and takes
+    precedence over `fast`. A single id (e.g. "2" for LRCLIB - see Lyrica's
+    fetch_controller.py FETCHER_MAP) restricts the check to exactly that one
+    source, skipping every other fetcher entirely rather than racing a fixed
+    pair - see LYRICS_FILTER_CHECK_MODE in lyrics_filter.py for why the
+    pre-selection filter defaults to this over fast=true.
     """
     params = {
         "artist": artist,
         "song": title,
         "timestamps": "true",
-        "fast": "true" if fast else "false",
     }
+    if sequence:
+        params["pass"] = "true"
+        params["sequence"] = sequence
+    else:
+        params["fast"] = "true" if fast else "false"
     try:
         response = httpx.get(f"{LYRICA_URL}/lyrics/", params=params, timeout=timeout)
     except httpx.HTTPError as exc:
