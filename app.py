@@ -3,9 +3,12 @@
 import os
 import re
 import subprocess
+import threading
 import time
+import urllib.parse
 
-from flask import Flask, jsonify, render_template, request
+import httpx
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
 import lyrica_client
 from search import KaraokeSearch
@@ -18,6 +21,18 @@ VIDEO_ID_PATTERN = re.compile(
     r"(?:v=|/videos/|embed/|youtu\.be/|/v/|/shorts/|/live/)([A-Za-z0-9_-]{11})"
 )
 VIDEO_ID_ONLY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+# googlevideo.com URLs are signed for the IP that resolved them and expire a few
+# hours later; fetching them straight from the browser also gets blocked by CORS
+# since the CDN sends no Access-Control-Allow-Origin. We keep resolved URLs
+# server-side and proxy the bytes through this process instead, per video_id.
+_STREAM_CACHE = {}
+_STREAM_CACHE_LOCK = threading.Lock()
+_STREAM_EXPIRY_BUFFER_S = 60
+_PROXY_CHUNK_SIZE = 256 * 1024
+_PASSTHROUGH_RESPONSE_HEADERS = ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges")
+
+_http_client = httpx.Client(follow_redirects=True, timeout=20.0)
 
 
 def _resolve_stream_urls(url, format_selector, timeout):
@@ -41,6 +56,68 @@ def _resolve_stream_urls(url, format_selector, timeout):
         raise RuntimeError(f"yt-dlp failed: {stderr}")
 
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _parse_expire_param(stream_url):
+    query = urllib.parse.urlparse(stream_url).query
+    try:
+        return int(urllib.parse.parse_qs(query)["expire"][0])
+    except (KeyError, ValueError, IndexError):
+        return None
+
+
+def _resolve_playable_stream_url(video_id, timeout):
+    """Resolve a browser-playable progressive stream URL, falling back from
+    separate best video/audio tracks to a single combined format."""
+    youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+    started_at = time.monotonic()
+
+    stream_urls = _resolve_stream_urls(
+        youtube_url,
+        "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
+        timeout,
+    )
+    if not stream_urls:
+        raise RuntimeError("yt-dlp did not return a stream URL")
+
+    if len(stream_urls) == 1:
+        return stream_urls[0], None
+
+    remaining_timeout = max(1, timeout - int(time.monotonic() - started_at))
+    progressive_urls = _resolve_stream_urls(youtube_url, "best[ext=mp4]/best", remaining_timeout)
+    if not progressive_urls:
+        raise RuntimeError("yt-dlp did not return a browser-playable stream URL")
+
+    warning = (
+        "yt-dlp returned separate best video/audio URLs; using a progressive browser-playable stream."
+    )
+    return progressive_urls[0], warning
+
+
+def _get_upstream_stream_url(video_id, timeout=20, force_refresh=False):
+    """Return a cached (or freshly resolved) upstream CDN URL for video_id.
+
+    Cached per video_id and re-resolved once it's within _STREAM_EXPIRY_BUFFER_S
+    of the signed URL's expiry, so scrubbing/buffering during a session doesn't
+    re-invoke yt-dlp on every byte-range request.
+    """
+    if force_refresh:
+        with _STREAM_CACHE_LOCK:
+            _STREAM_CACHE.pop(video_id, None)
+    else:
+        with _STREAM_CACHE_LOCK:
+            cached = _STREAM_CACHE.get(video_id)
+        if cached and (cached["expire"] is None or cached["expire"] - time.time() > _STREAM_EXPIRY_BUFFER_S):
+            return cached["url"], cached["warning"]
+
+    stream_url, warning = _resolve_playable_stream_url(video_id, timeout)
+    with _STREAM_CACHE_LOCK:
+        _STREAM_CACHE[video_id] = {
+            "url": stream_url,
+            "expire": _parse_expire_param(stream_url),
+            "warning": warning,
+        }
+    return stream_url, warning
 
 
 @app.route("/")
@@ -116,16 +193,8 @@ def stream_url():
     if not os.path.isfile(BINARY_PATH):
         return jsonify({"error": f"yt-dlp binary not found at {BINARY_PATH}"}), 500
 
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    timeout = 20
-    started_at = time.monotonic()
-
     try:
-        stream_urls = _resolve_stream_urls(
-            url,
-            "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
-            timeout,
-        )
+        _, warning = _get_upstream_stream_url(video_id)
     except subprocess.TimeoutExpired:
         return jsonify({"error": "Timed out while resolving the video stream URL"}), 504
     except OSError as exc:
@@ -133,32 +202,64 @@ def stream_url():
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 502
 
-    if not stream_urls:
-        return jsonify({"error": "yt-dlp did not return a stream URL"}), 502
-
-    response = {}
-    if len(stream_urls) > 1:
-        remaining_timeout = max(1, timeout - int(time.monotonic() - started_at))
-        try:
-            progressive_urls = _resolve_stream_urls(url, "best[ext=mp4]/best", remaining_timeout)
-        except subprocess.TimeoutExpired:
-            return jsonify({"error": "Timed out while resolving a browser-playable stream URL"}), 504
-        except OSError as exc:
-            return jsonify({"error": f"failed to execute yt-dlp: {exc}"}), 500
-        except RuntimeError as exc:
-            return jsonify({"error": str(exc)}), 502
-
-        if not progressive_urls:
-            return jsonify({"error": "yt-dlp did not return a browser-playable stream URL"}), 502
-
-        response["stream_url"] = progressive_urls[0]
-        response["warning"] = (
-            "yt-dlp returned separate best video/audio URLs; using a progressive browser-playable stream."
-        )
-    else:
-        response["stream_url"] = stream_urls[0]
-
+    # Point the player at our own proxy, not the raw googlevideo CDN URL: that
+    # URL is IP-signed to this server, has no CORS headers, and expires - all
+    # of which break direct browser playback. See /stream-proxy.
+    response = {"stream_url": f"/stream-proxy/{video_id}"}
+    if warning:
+        response["warning"] = warning
     return jsonify(response)
+
+
+@app.route("/stream-proxy/<video_id>")
+def stream_proxy(video_id):
+    video_id = video_id.strip()
+    if not VIDEO_ID_ONLY_PATTERN.match(video_id):
+        return jsonify({"error": "Invalid YouTube video id"}), 400
+
+    if not os.path.isfile(BINARY_PATH):
+        return jsonify({"error": f"yt-dlp binary not found at {BINARY_PATH}"}), 500
+
+    range_header = request.headers.get("Range")
+    req_headers = {"Range": range_header} if range_header else {}
+
+    def send_upstream(force_refresh=False):
+        upstream_url, _ = _get_upstream_stream_url(video_id, force_refresh=force_refresh)
+        upstream_request = _http_client.build_request("GET", upstream_url, headers=req_headers)
+        return _http_client.send(upstream_request, stream=True)
+
+    try:
+        upstream = send_upstream()
+        if upstream.status_code in (403, 404):
+            upstream.close()
+            upstream = send_upstream(force_refresh=True)
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Timed out while resolving the video stream URL"}), 504
+    except OSError as exc:
+        return jsonify({"error": f"failed to execute yt-dlp: {exc}"}), 500
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 502
+    except httpx.HTTPError as exc:
+        return jsonify({"error": f"failed to reach the video CDN: {exc}"}), 502
+
+    if upstream.status_code >= 400:
+        status = upstream.status_code
+        upstream.close()
+        return jsonify({"error": f"upstream CDN returned HTTP {status}"}), 502
+
+    def generate():
+        try:
+            for chunk in upstream.iter_bytes(_PROXY_CHUNK_SIZE):
+                yield chunk
+        finally:
+            upstream.close()
+
+    headers = {name: upstream.headers[name] for name in _PASSTHROUGH_RESPONSE_HEADERS if name in upstream.headers}
+    headers.setdefault("Accept-Ranges", "bytes")
+    headers["Access-Control-Allow-Origin"] = "*"
+    headers["Cache-Control"] = "no-store"
+
+    return Response(stream_with_context(generate()), status=upstream.status_code, headers=headers)
 
 
 @app.route("/lyrics")
@@ -191,4 +292,7 @@ def metadata():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    # threaded=True: /stream-proxy holds a connection open per in-flight range
+    # request (buffering + seeking issue several concurrently), which would
+    # otherwise serialize behind the dev server's single worker thread.
+    app.run(host="127.0.0.1", port=5000, debug=True, threaded=True)

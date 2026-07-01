@@ -277,6 +277,8 @@
   </div>
 
   <section class="player-shell" aria-label="Karaoke video player">
+    <!-- crossorigin is safe now that src is same-origin (/stream-proxy) - it no
+         longer triggers a CORS check against the un-CORS-headered googlevideo CDN. -->
     <video id="video" crossorigin="anonymous" autoplay muted playsinline></video>
     <div id="video-overlay" class="overlay">
       <div>
