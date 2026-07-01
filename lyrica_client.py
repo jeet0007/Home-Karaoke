@@ -18,6 +18,13 @@ LYRICA_URL = os.environ.get("LYRICA_URL", "http://localhost:5001").rstrip("/")
 TIMEOUT = 10.0
 
 
+def _as_time_ms(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _fetch_lyrics_data(artist, title):
     """Hit Lyrica's /lyrics/ endpoint and return its `data` payload, or None."""
     params = {"artist": artist, "song": title, "timestamps": "true"}
@@ -52,7 +59,7 @@ def get_lyrics(artist, title, duration=None):
 
     timed = data.get("timed_lyrics") or []
     return [
-        {"time_ms": line.get("start_time", 0), "text": line.get("text", "")}
+        {"time_ms": _as_time_ms(line.get("start_time")), "text": line.get("text", "")}
         for line in timed
     ]
 
@@ -65,7 +72,7 @@ def get_lyrics_full(artist, title, duration=None):
 
     timed = data.get("timed_lyrics") or []
     synced = [
-        {"time_ms": line.get("start_time", 0), "text": line.get("text", "")}
+        {"time_ms": _as_time_ms(line.get("start_time")), "text": line.get("text", "")}
         for line in timed
     ]
 
