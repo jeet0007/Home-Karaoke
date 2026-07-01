@@ -132,7 +132,7 @@ class UnifiedSearchRouteTestCase(unittest.TestCase):
         mock_karaoke_search.return_value = [dict(VIDEO_RESULT)]
 
         with patch("lyrica_client.check_lyrics_available") as mock_check:
-            mock_check.side_effect = lambda artist, title, timeout=None: (artist, title) == ("Passenger", "Let Her Go")
+            mock_check.side_effect = lambda artist, title, timeout=None, fast=None: (artist, title) == ("Passenger", "Let Her Go")
             resp = self.client.get("/unified-search?q=anything")
 
         data = resp.get_json()

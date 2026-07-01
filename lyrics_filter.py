@@ -6,6 +6,11 @@ trips to Lyrica per search would multiply latency by N. Each check carries
 its own timeout (via httpx, passed through lyrica_client.check_lyrics_available)
 so a single slow/hanging candidate can't stall the whole batch.
 
+Each check also asks Lyrica for its fast=true mode by default (see
+FAST_LYRICS_CHECK below) - these are pre-selection checks over candidates
+the user hasn't picked yet, so a quick LRCLIB+YouTube race is preferred over
+Lyrica's full sequential source chain.
+
 Only the first `cap` candidates are checked at all (default 15) to keep
 response times bounded regardless of how many candidates the underlying
 search returned; anything beyond the cap is dropped, not silently kept.
@@ -31,6 +36,7 @@ Three outcomes per candidate, from lyrica_client.check_lyrics_available:
     going on rather than one flaky candidate.
 """
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -40,6 +46,18 @@ import lyrica_client
 DEFAULT_CHECK_CAP = 15
 DEFAULT_PER_CHECK_TIMEOUT = 6.0
 DEFAULT_MAX_WORKERS = 8
+
+# These are pre-selection checks over candidates the user hasn't picked yet
+# (and may never pick) - Lyrica's fast=true mode races only its two fastest,
+# most reliable sources (LRCLIB + YouTube) in parallel, instead of walking
+# its full 6-source sequential chain. Trade-off: a candidate whose ONLY
+# lyrics source is one of the four skipped ones (NetEase, Megalobiz,
+# Musixmatch, SimpMusic) can be filtered out here even though the full
+# post-selection fetch (get_lyrics_full/get_lyrics, unaffected by this flag)
+# might have found it. That's judged an acceptable trade for search-time
+# latency/reliability - see PR description. Overridable via env var without
+# a code change in case that trade-off needs retuning later.
+FAST_LYRICS_CHECK = os.environ.get("LYRICS_FILTER_FAST_CHECK", "true").lower() != "false"
 
 # One bounded retry for a timeout specifically (not other error types - see
 # module docstring): timeouts are the shape of error most likely to be a
@@ -70,7 +88,9 @@ def _check_lyrics_with_retry(artist, title, timeout):
     attempts = MAX_TIMEOUT_RETRIES + 1
     for attempt in range(attempts):
         try:
-            return lyrica_client.check_lyrics_available(artist, title, timeout=timeout)
+            return lyrica_client.check_lyrics_available(
+                artist, title, timeout=timeout, fast=FAST_LYRICS_CHECK
+            )
         except lyrica_client.LyricaUnavailableError as exc:
             is_timeout = isinstance(exc.__cause__, httpx.TimeoutException)
             if attempt < attempts - 1 and is_timeout:

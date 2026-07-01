@@ -28,14 +28,27 @@ class LyricaUnavailableError(Exception):
     """
 
 
-def check_lyrics_available(artist, title, timeout=TIMEOUT):
+def check_lyrics_available(artist, title, timeout=TIMEOUT, fast=True):
     """Return True/False for whether Lyrica has lyrics for artist/title.
 
     Raises LyricaUnavailableError instead of returning False when we can't get
     a definitive answer (network error, timeout, bad response) - the caller
     must not conflate "couldn't check" with "confirmed absent".
+
+    `fast` (default True) sets Lyrica's `fast=true`, which races only
+    LRCLIB + YouTube in parallel instead of walking Lyrica's full 6-source
+    sequential chain (LRCLIB, YouTube, NetEase, Megalobiz, Musixmatch,
+    SimpMusic). This is meant for pre-selection availability checks over many
+    unpicked search candidates, where speed matters more than exhausting
+    every source - see lyrics_filter.py. Callers doing a real one-shot lookup
+    on a single confirmed song should pass fast=False.
     """
-    params = {"artist": artist, "song": title, "timestamps": "true"}
+    params = {
+        "artist": artist,
+        "song": title,
+        "timestamps": "true",
+        "fast": "true" if fast else "false",
+    }
     try:
         response = httpx.get(f"{LYRICA_URL}/lyrics/", params=params, timeout=timeout)
     except httpx.HTTPError as exc:
