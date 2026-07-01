@@ -368,8 +368,8 @@
   async function togglePlayback() {
     if (!video.src) return;
 
+    video.muted = false;
     if (video.paused) {
-      video.muted = false;
       try {
         await video.play();
       } catch (err) {
@@ -384,8 +384,8 @@
   async function restartVideo() {
     if (!video.src) return;
 
-    video.currentTime = 0;
     video.muted = false;
+    video.currentTime = 0;
     currentLyricIndex = -1;
     updateCurrentLyric(0);
     try {

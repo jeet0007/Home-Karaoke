@@ -91,7 +91,7 @@ def player():
     if not video_id:
         return "Missing required query parameter 'video_id'", 400
 
-    if not url:
+    if not url.startswith(("http://", "https://")):
         url = f"https://www.youtube.com/watch?v={video_id}"
 
     return render_template(
