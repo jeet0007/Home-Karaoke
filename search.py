@@ -10,6 +10,7 @@ BINARY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "binaries
 # Substrings checked against the lowercased title.
 BOOST_KEYWORDS = {
     "karaoke": 15,
+    "lyrics": 10,
     "instrumental": 10,
     "backing track": 10,
     "no vocals": 10,
@@ -25,6 +26,7 @@ CHANNEL_BOOST_KEYWORDS = (
     "karaoke",
     "instrumental",
     "backingtracks",
+    "backing track",
     "backing tracks",
     "minus one",
     "karafun",
@@ -199,7 +201,7 @@ class KaraokeSearch:
         channel = (uploader or "").lower()
         if CHANNEL_NOISE_PATTERN.search(channel):
             score -= CHANNEL_NOISE_PENALTY
-        elif any(keyword in channel for keyword in CHANNEL_BOOST_KEYWORDS):
+        if any(keyword in channel for keyword in CHANNEL_BOOST_KEYWORDS):
             score += CHANNEL_BOOST
 
         if duration is not None:
