@@ -9,6 +9,7 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import lyrica_client  # noqa: E402
+import lyrics_filter  # noqa: E402
 from lyrics_filter import filter_candidates_by_lyrics  # noqa: E402
 
 
@@ -38,7 +39,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
     def test_keeps_has_lyrics_drops_no_lyrics(self, mock_check):
         songs = self._songs(3)
         # song 0 has lyrics, song 1 doesn't, song 2 has lyrics
-        mock_check.side_effect = lambda artist, title, timeout=None: title != "Song 1"
+        mock_check.side_effect = lambda artist, title, timeout=None, fast=None: title != "Song 1"
 
         kept, degraded = filter_candidates_by_lyrics(songs, _song_identity)
 
@@ -49,7 +50,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
     def test_excludes_candidate_on_lyrica_error_instead_of_failing_open(self, mock_check):
         songs = self._songs(2)
 
-        def side_effect(artist, title, timeout=None):
+        def side_effect(artist, title, timeout=None, fast=None):
             if title == "Song 0":
                 raise _non_timeout_error("boom")
             return True
@@ -70,7 +71,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         # this is "this one candidate had a hiccup", not "Lyrica is down".
         songs = self._songs(15)
 
-        def side_effect(artist, title, timeout=None):
+        def side_effect(artist, title, timeout=None, fast=None):
             if title == "Song 0":
                 raise _non_timeout_error("boom")
             return True
@@ -90,7 +91,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         # not 12 coincidentally-unavailable songs.
         songs = self._songs(15)
 
-        def side_effect(artist, title, timeout=None):
+        def side_effect(artist, title, timeout=None, fast=None):
             index = int(title.split()[-1])
             if index < 12:
                 raise _non_timeout_error("service down")
@@ -117,7 +118,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
     def test_retries_once_on_timeout_then_succeeds(self, mock_check):
         calls = {"Song 0": 0}
 
-        def side_effect(artist, title, timeout=None):
+        def side_effect(artist, title, timeout=None, fast=None):
             if title == "Song 0":
                 calls["Song 0"] += 1
                 if calls["Song 0"] == 1:
@@ -138,7 +139,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
     def test_timeout_retry_is_bounded_then_excludes(self, mock_check):
         # Every attempt times out - the retry budget (1) is spent and the
         # candidate is still excluded, not kept.
-        mock_check.side_effect = lambda artist, title, timeout=None: (_ for _ in ()).throw(_timeout_error())
+        mock_check.side_effect = lambda artist, title, timeout=None, fast=None: (_ for _ in ()).throw(_timeout_error())
         songs = self._songs(1)
 
         kept, degraded = filter_candidates_by_lyrics(songs, _song_identity)
@@ -148,7 +149,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
 
     @patch("lyrics_filter.lyrica_client.check_lyrics_available")
     def test_non_timeout_error_is_not_retried(self, mock_check):
-        mock_check.side_effect = lambda artist, title, timeout=None: (_ for _ in ()).throw(_non_timeout_error())
+        mock_check.side_effect = lambda artist, title, timeout=None, fast=None: (_ for _ in ()).throw(_non_timeout_error())
         songs = self._songs(1)
 
         kept, degraded = filter_candidates_by_lyrics(songs, _song_identity)
@@ -173,7 +174,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         def identity_fn(_candidate):
             return [("Let Her Go", "Passenger"), ("Passenger", "Let Her Go")]
 
-        def side_effect(artist, title, timeout=None):
+        def side_effect(artist, title, timeout=None, fast=None):
             return (artist, title) == ("Passenger", "Let Her Go")
 
         mock_check.side_effect = side_effect
@@ -208,7 +209,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
     def test_checks_run_concurrently_not_serialized(self, mock_check):
         # Each check "blocks" for 0.2s; 8 candidates run sequentially would take
         # ~1.6s. With the default thread pool they should overlap heavily.
-        def slow_check(artist, title, timeout=None):
+        def slow_check(artist, title, timeout=None, fast=None):
             time.sleep(0.2)
             return True
 
@@ -228,7 +229,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         # would reorder them - results must come back in input order regardless.
         delays = {"Song 0": 0.15, "Song 1": 0.05, "Song 2": 0.1}
 
-        def side_effect(artist, title, timeout=None):
+        def side_effect(artist, title, timeout=None, fast=None):
             time.sleep(delays.get(title, 0))
             return True
 
@@ -238,6 +239,34 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         kept, _ = filter_candidates_by_lyrics(songs, _song_identity)
 
         self.assertEqual([s["title"] for s in kept], ["Song 0", "Song 1", "Song 2"])
+
+    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    def test_uses_fast_check_by_default(self, mock_check):
+        # Pre-selection candidate checks must ask Lyrica for fast=true
+        # (LRCLIB+YouTube only) rather than its full 6-source sequential
+        # chain - see FAST_LYRICS_CHECK in lyrics_filter.py.
+        mock_check.return_value = True
+        songs = self._songs(1)
+
+        filter_candidates_by_lyrics(songs, _song_identity)
+
+        _args, kwargs = mock_check.call_args
+        self.assertTrue(kwargs["fast"])
+
+    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    def test_fast_check_can_be_disabled_via_env_var(self, mock_check):
+        # FAST_LYRICS_CHECK is read from LYRICS_FILTER_FAST_CHECK once at
+        # import time; patch the resolved module attribute directly rather
+        # than reloading the module (which would also re-bind lyrica_client
+        # under the mock in ways unrelated to this test).
+        mock_check.return_value = True
+        songs = self._songs(1)
+
+        with patch.object(lyrics_filter, "FAST_LYRICS_CHECK", False):
+            lyrics_filter.filter_candidates_by_lyrics(songs, _song_identity)
+
+        _args, kwargs = mock_check.call_args
+        self.assertFalse(kwargs["fast"])
 
 
 if __name__ == "__main__":

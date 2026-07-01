@@ -62,6 +62,60 @@ class CheckLyricsAvailableTestCase(unittest.TestCase):
         with self.assertRaises(lyrica_client.LyricaUnavailableError):
             lyrica_client.check_lyrics_available("Passenger", "Let Her Go")
 
+    @patch("lyrica_client.httpx.get")
+    def test_sends_fast_true_by_default(self, mock_get):
+        # Pre-selection availability checks (this function's only caller is
+        # lyrics_filter.py, over candidates the user hasn't picked yet) must
+        # ask Lyrica for fast=true - LRCLIB+YouTube racing in parallel -
+        # instead of falling through Lyrica's default sequential 6-source
+        # chain (LRCLIB, YouTube, NetEase, Megalobiz, Musixmatch, SimpMusic).
+        mock_get.return_value = _response(json_body={"status": "success", "data": {"plain_lyrics": "la la la"}})
+
+        lyrica_client.check_lyrics_available("Passenger", "Let Her Go")
+
+        _args, kwargs = mock_get.call_args
+        self.assertEqual(kwargs["params"]["fast"], "true")
+
+    @patch("lyrica_client.httpx.get")
+    def test_fast_false_opts_out_of_fast_mode(self, mock_get):
+        mock_get.return_value = _response(json_body={"status": "success", "data": {"plain_lyrics": "la la la"}})
+
+        lyrica_client.check_lyrics_available("Passenger", "Let Her Go", fast=False)
+
+        _args, kwargs = mock_get.call_args
+        self.assertEqual(kwargs["params"]["fast"], "false")
+
+
+class FullLyricsFetchUsesFullChainTestCase(unittest.TestCase):
+    """get_lyrics_full()/get_lyrics() are the post-selection fetch for the
+    one song the user actually picked - they must NOT set Lyrica's fast=true
+    and so keep walking its full multi-source chain for best quality/accuracy,
+    unlike the pre-selection check above."""
+
+    @patch("lyrica_client.httpx.get")
+    def test_get_lyrics_full_does_not_request_fast_mode(self, mock_get):
+        mock_get.return_value = _response(json_body={
+            "status": "success",
+            "data": {"plain_lyrics": "la la la", "source": "lrclib"},
+        })
+
+        lyrica_client.get_lyrics_full("Passenger", "Let Her Go")
+
+        _args, kwargs = mock_get.call_args
+        self.assertNotIn("fast", kwargs["params"])
+
+    @patch("lyrica_client.httpx.get")
+    def test_get_lyrics_does_not_request_fast_mode(self, mock_get):
+        mock_get.return_value = _response(json_body={
+            "status": "success",
+            "data": {"timed_lyrics": [{"start_time": 0, "text": "la"}]},
+        })
+
+        lyrica_client.get_lyrics("Passenger", "Let Her Go")
+
+        _args, kwargs = mock_get.call_args
+        self.assertNotIn("fast", kwargs["params"])
+
 
 if __name__ == "__main__":
     unittest.main()
