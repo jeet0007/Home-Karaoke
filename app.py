@@ -14,9 +14,11 @@ from flask import Flask, Response, jsonify, render_template, request, stream_wit
 
 import lyrica_client
 from search import KaraokeSearch
+from song_search import SongSearch, SongSearchError
 
 app = Flask(__name__)
 karaoke_search = KaraokeSearch()
+song_search = SongSearch()
 BINARY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "binaries", "yt-dlp")
 
 VIDEO_ID_PATTERN = re.compile(
@@ -155,6 +157,25 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/songs")
+def songs():
+    return render_template("song_search.html")
+
+
+def _run_karaoke_search(query, limit):
+    """Run KaraokeSearch and translate its exceptions into (json, status) error
+    tuples, shared by /search and /video-search which differ only in how they
+    build `query` (raw free text vs. a clean artist/title identity)."""
+    try:
+        return karaoke_search.search(query, max_results=limit), None
+    except FileNotFoundError as exc:
+        return None, (jsonify({"error": str(exc)}), 500)
+    except TimeoutError as exc:
+        return None, (jsonify({"error": str(exc)}), 504)
+    except RuntimeError as exc:
+        return None, (jsonify({"error": str(exc)}), 502)
+
+
 @app.route("/search")
 def search():
     query = request.args.get("q", "").strip()
@@ -164,16 +185,49 @@ def search():
     limit = request.args.get("limit", 10, type=int) or 10
     limit = max(1, min(limit, 50))
 
-    try:
-        results = karaoke_search.search(query, max_results=limit)
-    except FileNotFoundError as exc:
-        return jsonify({"error": str(exc)}), 500
-    except TimeoutError as exc:
-        return jsonify({"error": str(exc)}), 504
-    except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 502
+    results, error = _run_karaoke_search(query, limit)
+    if error:
+        return error
 
     return jsonify({"query": query, "count": len(results), "results": results})
+
+
+@app.route("/song-search")
+def song_search_route():
+    query = request.args.get("q", "").strip()
+    if not query:
+        return jsonify({"error": "Missing required query parameter 'q'"}), 400
+
+    limit = request.args.get("limit", 10, type=int) or 10
+    limit = max(1, min(limit, 50))
+
+    try:
+        results = song_search.search(query, limit=limit)
+    except SongSearchError as exc:
+        return jsonify({"error": str(exc)}), exc.status_code
+
+    return jsonify({"query": query, "count": len(results), "results": results})
+
+
+@app.route("/video-search")
+def video_search():
+    """Find a karaoke video for a known-good song identity (artist/title),
+    reusing the existing yt-dlp karaoke ranking - the song identity is fixed,
+    but the video choice stays flexible/ranked, same as /search."""
+    artist = request.args.get("artist", "").strip()
+    title = request.args.get("title", "").strip()
+    if not artist or not title:
+        return jsonify({"error": "Missing required query parameters 'artist' and 'title'"}), 400
+
+    limit = request.args.get("limit", 10, type=int) or 10
+    limit = max(1, min(limit, 50))
+
+    query = f"{title} {artist}"
+    results, error = _run_karaoke_search(query, limit)
+    if error:
+        return error
+
+    return jsonify({"query": query, "artist": artist, "title": title, "count": len(results), "results": results})
 
 
 @app.route("/preview")
