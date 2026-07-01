@@ -4,6 +4,8 @@ import time
 import unittest
 from unittest.mock import patch
 
+import httpx
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import lyrica_client  # noqa: E402
@@ -12,6 +14,20 @@ from lyrics_filter import filter_candidates_by_lyrics  # noqa: E402
 
 def _song_identity(song):
     return (song["artist"], song["title"])
+
+
+def _timeout_error(message="timed out"):
+    """Build a LyricaUnavailableError whose __cause__ makes it look like the
+    real client's timeout path, so the retry-on-timeout logic kicks in."""
+    err = lyrica_client.LyricaUnavailableError(message)
+    err.__cause__ = httpx.TimeoutException(message)
+    return err
+
+
+def _non_timeout_error(message="boom"):
+    """A LyricaUnavailableError with no timeout cause (e.g. HTTP 500, bad
+    JSON) - should NOT be retried."""
+    return lyrica_client.LyricaUnavailableError(message)
 
 
 class FilterCandidatesByLyricsTestCase(unittest.TestCase):
@@ -30,31 +46,115 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         self.assertFalse(degraded)
 
     @patch("lyrics_filter.lyrica_client.check_lyrics_available")
-    def test_fails_open_on_lyrica_error(self, mock_check):
+    def test_excludes_candidate_on_lyrica_error_instead_of_failing_open(self, mock_check):
         songs = self._songs(2)
 
         def side_effect(artist, title, timeout=None):
             if title == "Song 0":
-                raise lyrica_client.LyricaUnavailableError("boom")
+                raise _non_timeout_error("boom")
             return True
 
         mock_check.side_effect = side_effect
 
         kept, degraded = filter_candidates_by_lyrics(songs, _song_identity)
 
-        # Song 0 errored but is kept (fail open), Song 1 confirmed has lyrics.
-        self.assertEqual({s["title"] for s in kept}, {"Song 0", "Song 1"})
+        # Song 0 errored (unverified) and must be EXCLUDED, not kept - a
+        # single candidate's check failing is not grounds to hand the user
+        # something with no confirmed lyrics. Song 1 confirmed has lyrics.
+        self.assertEqual({s["title"] for s in kept}, {"Song 1"})
         self.assertFalse(degraded)
 
     @patch("lyrics_filter.lyrica_client.check_lyrics_available")
-    def test_degraded_true_only_when_every_check_errors(self, mock_check):
-        songs = self._songs(3)
-        mock_check.side_effect = lyrica_client.LyricaUnavailableError("service down")
+    def test_single_candidate_error_amid_healthy_batch_is_not_degraded(self, mock_check):
+        # 1 error out of 15 (~7%) is well under the systemic threshold -
+        # this is "this one candidate had a hiccup", not "Lyrica is down".
+        songs = self._songs(15)
+
+        def side_effect(artist, title, timeout=None):
+            if title == "Song 0":
+                raise _non_timeout_error("boom")
+            return True
+
+        mock_check.side_effect = side_effect
 
         kept, degraded = filter_candidates_by_lyrics(songs, _song_identity)
 
-        self.assertEqual(len(kept), 3)  # fail-open keeps everything
+        self.assertEqual(len(kept), 14)
+        self.assertNotIn("Song 0", {s["title"] for s in kept})
+        self.assertFalse(degraded)
+
+    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    def test_degraded_true_when_error_ratio_crosses_threshold(self, mock_check):
+        # 12/15 (80%) erroring is the "Lyrica itself is unreachable" shape:
+        # unrelated songs failing together points at a shared failure point,
+        # not 12 coincidentally-unavailable songs.
+        songs = self._songs(15)
+
+        def side_effect(artist, title, timeout=None):
+            index = int(title.split()[-1])
+            if index < 12:
+                raise _non_timeout_error("service down")
+            return True
+
+        mock_check.side_effect = side_effect
+
+        kept, degraded = filter_candidates_by_lyrics(songs, _song_identity)
+
+        self.assertEqual({s["title"] for s in kept}, {"Song 12", "Song 13", "Song 14"})
         self.assertTrue(degraded)
+
+    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    def test_degraded_true_when_every_check_errors(self, mock_check):
+        songs = self._songs(3)
+        mock_check.side_effect = _non_timeout_error("service down")
+
+        kept, degraded = filter_candidates_by_lyrics(songs, _song_identity)
+
+        self.assertEqual(kept, [])  # unverified candidates are excluded, not kept
+        self.assertTrue(degraded)
+
+    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    def test_retries_once_on_timeout_then_succeeds(self, mock_check):
+        calls = {"Song 0": 0}
+
+        def side_effect(artist, title, timeout=None):
+            if title == "Song 0":
+                calls["Song 0"] += 1
+                if calls["Song 0"] == 1:
+                    raise _timeout_error()
+                return True
+            return True
+
+        mock_check.side_effect = side_effect
+        songs = self._songs(2)
+
+        kept, degraded = filter_candidates_by_lyrics(songs, _song_identity)
+
+        self.assertEqual({s["title"] for s in kept}, {"Song 0", "Song 1"})
+        self.assertEqual(calls["Song 0"], 2)  # one retry happened
+        self.assertFalse(degraded)
+
+    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    def test_timeout_retry_is_bounded_then_excludes(self, mock_check):
+        # Every attempt times out - the retry budget (1) is spent and the
+        # candidate is still excluded, not kept.
+        mock_check.side_effect = lambda artist, title, timeout=None: (_ for _ in ()).throw(_timeout_error())
+        songs = self._songs(1)
+
+        kept, degraded = filter_candidates_by_lyrics(songs, _song_identity)
+
+        self.assertEqual(kept, [])
+        self.assertEqual(mock_check.call_count, 2)  # original attempt + 1 retry
+
+    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    def test_non_timeout_error_is_not_retried(self, mock_check):
+        mock_check.side_effect = lambda artist, title, timeout=None: (_ for _ in ()).throw(_non_timeout_error())
+        songs = self._songs(1)
+
+        kept, degraded = filter_candidates_by_lyrics(songs, _song_identity)
+
+        self.assertEqual(kept, [])
+        self.assertEqual(mock_check.call_count, 1)  # no retry for a non-timeout error
 
     @patch("lyrics_filter.lyrica_client.check_lyrics_available")
     def test_caps_number_of_candidates_checked(self, mock_check):
