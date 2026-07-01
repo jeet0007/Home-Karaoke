@@ -9,7 +9,9 @@ from search import KaraokeSearch
 app = Flask(__name__)
 karaoke_search = KaraokeSearch()
 
-VIDEO_ID_PATTERN = re.compile(r"(?:v=|/videos/|embed/|youtu\.be/|/v/)([A-Za-z0-9_-]{11})")
+VIDEO_ID_PATTERN = re.compile(
+    r"(?:v=|/videos/|embed/|youtu\.be/|/v/|/shorts/|/live/)([A-Za-z0-9_-]{11})"
+)
 
 
 @app.route("/")

@@ -20,13 +20,67 @@ PENALTY_KEYWORDS = {
     "reaction": 8,
 }
 
+# Substrings checked against the lowercased uploader/channel name.
+CHANNEL_BOOST_KEYWORDS = (
+    "karaoke",
+    "instrumental",
+    "backingtracks",
+    "backing tracks",
+    "minus one",
+    "karafun",
+)
+CHANNEL_BOOST = 8
+
+# YouTube auto-generates "<Artist> - Topic" channels for official studio
+# releases; these are almost never karaoke tracks.
+CHANNEL_NOISE_PATTERN = re.compile(r"-\s*topic$", re.IGNORECASE)
+CHANNEL_NOISE_PENALTY = 10
+
+MIN_DURATION_SECONDS = 60
+MAX_DURATION_SECONDS = 900
+SHORT_DURATION_PENALTY = 12
+LONG_DURATION_PENALTY = 6
+
+# Bracketed/parenthesised exact phrases, e.g. "(karaoke version)", "[karaoke]".
+EXACT_PHRASE_PATTERN = re.compile(
+    r"[\(\[]\s*"
+    r"(karaoke(?:\s+version)?|instrumental(?:\s+version)?|backing\s*tracks?|no\s+vocals|minus\s+one|karafun)"
+    r"\s*[\)\]]",
+    re.IGNORECASE,
+)
+EXACT_PHRASE_BONUS = 5
+
+LYRICS_KEYWORDS = ("with lyrics", "lyrics on screen")
+LYRICS_BONUS = 3
+
+HARD_PENALTY_KEYWORDS = (
+    "interview",
+    "tutorial",
+    "how to",
+    "lesson",
+    "drum cover",
+    "guitar cover",
+    "piano cover",
+    "bass cover",
+    "violin cover",
+    "unboxing",
+    "vlog",
+    "podcast",
+    "live performance",
+)
+HARD_PENALTY_WEIGHT = 15
+
+SCORE_MIN = -30
+SCORE_MAX = 50
+
 
 class KaraokeSearch:
     """Searches YouTube via yt-dlp and ranks results by karaoke-quality signals."""
 
-    def __init__(self, binary_path=None, timeout=30):
+    def __init__(self, binary_path=None, timeout=30, score_floor=-5):
         self.binary_path = binary_path or BINARY_PATH
         self.timeout = timeout
+        self.score_floor = score_floor
 
     def search(self, query, max_results=10):
         """Search for karaoke versions of `query` (auto-appends "karaoke")."""
@@ -76,6 +130,7 @@ class KaraokeSearch:
                 continue
 
         results = [self._to_result(entry) for entry in entries]
+        results = [r for r in results if r["score"] >= self.score_floor]
         results.sort(key=lambda r: r["score"], reverse=True)
         return results
 
@@ -85,15 +140,17 @@ class KaraokeSearch:
         url = entry.get("url") or entry.get("webpage_url")
         if not url and video_id:
             url = f"https://www.youtube.com/watch?v={video_id}"
+        uploader = entry.get("uploader") or entry.get("channel") or "Unknown"
+        duration = entry.get("duration")
 
         return {
             "title": title,
             "url": url,
-            "duration": self._format_duration(entry.get("duration")),
+            "duration": self._format_duration(duration),
             "thumbnail": self._best_thumbnail(entry),
-            "uploader": entry.get("uploader") or entry.get("channel") or "Unknown",
+            "uploader": uploader,
             "view_count": entry.get("view_count"),
-            "score": self._score(title),
+            "score": self._score(title, uploader, duration),
         }
 
     @staticmethod
@@ -107,7 +164,10 @@ class KaraokeSearch:
     def _format_duration(seconds):
         if seconds is None:
             return None
-        seconds = int(seconds)
+        try:
+            seconds = int(seconds)
+        except (TypeError, ValueError):
+            return None
         hours, remainder = divmod(seconds, 3600)
         minutes, secs = divmod(remainder, 60)
         if hours:
@@ -115,13 +175,42 @@ class KaraokeSearch:
         return f"{minutes}:{secs:02d}"
 
     @staticmethod
-    def _score(title):
+    def _score(title, uploader="", duration=None):
         text = title.lower()
         score = 0
+
         for keyword, weight in BOOST_KEYWORDS.items():
             if keyword in text:
                 score += weight
         for keyword, weight in PENALTY_KEYWORDS.items():
             if re.search(rf"\b{re.escape(keyword)}\b", text):
                 score -= weight
-        return score
+
+        if EXACT_PHRASE_PATTERN.search(text):
+            score += EXACT_PHRASE_BONUS
+
+        if any(keyword in text for keyword in LYRICS_KEYWORDS):
+            score += LYRICS_BONUS
+
+        for keyword in HARD_PENALTY_KEYWORDS:
+            if re.search(rf"\b{re.escape(keyword)}\b", text):
+                score -= HARD_PENALTY_WEIGHT
+
+        channel = (uploader or "").lower()
+        if CHANNEL_NOISE_PATTERN.search(channel):
+            score -= CHANNEL_NOISE_PENALTY
+        elif any(keyword in channel for keyword in CHANNEL_BOOST_KEYWORDS):
+            score += CHANNEL_BOOST
+
+        if duration is not None:
+            try:
+                duration = float(duration)
+            except (TypeError, ValueError):
+                duration = None
+        if duration is not None:
+            if duration < MIN_DURATION_SECONDS:
+                score -= SHORT_DURATION_PENALTY
+            elif duration > MAX_DURATION_SECONDS:
+                score -= LONG_DURATION_PENALTY
+
+        return max(SCORE_MIN, min(SCORE_MAX, score))
