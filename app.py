@@ -190,7 +190,7 @@ def search():
         return jsonify({"error": "Missing required query parameter 'q'"}), 400
 
     limit = request.args.get("limit", 10, type=int) or 10
-    limit = max(1, min(limit, 50))
+    limit = max(1, min(limit, LYRICS_CHECK_CAP))
 
     results, error = _run_karaoke_search(query, limit)
     if error:
@@ -206,7 +206,7 @@ def song_search_route():
         return jsonify({"error": "Missing required query parameter 'q'"}), 400
 
     limit = request.args.get("limit", 10, type=int) or 10
-    limit = max(1, min(limit, 50))
+    limit = max(1, min(limit, LYRICS_CHECK_CAP))
 
     try:
         results = song_search.search(query, limit=limit)
@@ -227,7 +227,7 @@ def video_search():
         return jsonify({"error": "Missing required query parameters 'artist' and 'title'"}), 400
 
     limit = request.args.get("limit", 10, type=int) or 10
-    limit = max(1, min(limit, 50))
+    limit = max(1, min(limit, LYRICS_CHECK_CAP))
 
     query = f"{title} {artist}"
     results, error = _run_karaoke_search(query, limit)
@@ -273,7 +273,7 @@ def unified_search():
         return jsonify({"error": "Missing required query parameter 'q'"}), 400
 
     limit = request.args.get("limit", UNIFIED_SEARCH_DEFAULT_LIMIT, type=int) or UNIFIED_SEARCH_DEFAULT_LIMIT
-    limit = max(1, min(limit, 50))
+    limit = max(1, min(limit, LYRICS_CHECK_CAP))
 
     song_error = None
     song_results = []
