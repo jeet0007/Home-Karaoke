@@ -10,11 +10,16 @@ import time
 import urllib.parse
 
 import httpx
-from flask import Flask, Response, jsonify, render_template, request, stream_with_context
+from flask import Flask, Response, jsonify, redirect, render_template, request, stream_with_context, url_for
 
 import lyrica_client
+from fallback_search import parse_title_identity_candidates
+from lyrics_filter import filter_candidates_by_lyrics
 from search import KaraokeSearch
 from song_search import SongSearch, SongSearchError
+
+LYRICS_CHECK_CAP = 15
+UNIFIED_SEARCH_DEFAULT_LIMIT = 12
 
 app = Flask(__name__)
 karaoke_search = KaraokeSearch()
@@ -159,7 +164,9 @@ def index():
 
 @app.route("/songs")
 def songs():
-    return render_template("song_search.html")
+    """Retired as its own page in favor of the unified `/` search - redirect
+    so old bookmarks/links still land somewhere useful."""
+    return redirect(url_for("index"), code=301)
 
 
 def _run_karaoke_search(query, limit):
@@ -228,6 +235,82 @@ def video_search():
         return error
 
     return jsonify({"query": query, "artist": artist, "title": title, "count": len(results), "results": results})
+
+
+def _song_identity(song):
+    return (song.get("artist", ""), song.get("title", ""))
+
+
+def _video_identity_candidates(video):
+    return parse_title_identity_candidates(video.get("title", ""))
+
+
+def _apply_resolved_identity(video):
+    """Attach a best-guess artist/clean_title to a fallback video result, for
+    the player/lyrics-fetch step downstream. Prefers the identity confirmed
+    by the lyrics check; falls back to the raw uploader/title (today's
+    behavior) when the check errored (fail-open) rather than confirmed one
+    of the parsed guesses."""
+    resolved = video.pop("_resolved_identity", None)
+    artist, title = resolved if resolved else (video.get("uploader") or "", video.get("title") or "")
+    return {**video, "artist": artist, "clean_title": title}
+
+
+@app.route("/unified-search")
+def unified_search():
+    """Single search entry point behind the unified `/` page.
+
+    Primary path: resolve the query to a clean song identity via ytmusicapi
+    (song_search.py), then keep only identities Lyrica confirms have lyrics.
+    If that yields nothing usable - ytmusicapi found nothing, errored, or
+    none of what it found has lyrics - fall back to ranking raw karaoke
+    videos directly (search.py), lyrics-filtered the same way but with
+    artist/title guessed from the video title (fallback_search.py) since
+    those videos carry no structured metadata.
+    """
+    query = request.args.get("q", "").strip()
+    if not query:
+        return jsonify({"error": "Missing required query parameter 'q'"}), 400
+
+    limit = request.args.get("limit", UNIFIED_SEARCH_DEFAULT_LIMIT, type=int) or UNIFIED_SEARCH_DEFAULT_LIMIT
+    limit = max(1, min(limit, 50))
+
+    song_error = None
+    song_results = []
+    try:
+        song_results = song_search.search(query, limit=limit)
+    except SongSearchError as exc:
+        song_error = exc
+
+    if song_results:
+        kept, degraded = filter_candidates_by_lyrics(song_results, _song_identity, cap=LYRICS_CHECK_CAP)
+        if kept:
+            response = {"query": query, "mode": "songs", "count": len(kept[:limit]), "results": kept[:limit]}
+            if degraded:
+                response["warning"] = "Lyrics availability check is temporarily unavailable; results are unfiltered."
+            return jsonify(response)
+
+    # Nothing usable from the song-identity path - fall back to direct
+    # karaoke video search, same as the original /search route.
+    video_results, error = _run_karaoke_search(query, limit)
+    if error:
+        if song_error:
+            return jsonify({"error": f"song search failed ({song_error}); fallback video search also failed"}), 502
+        return error
+
+    kept, degraded = filter_candidates_by_lyrics(video_results, _video_identity_candidates, cap=LYRICS_CHECK_CAP)
+    kept = [_apply_resolved_identity(v) for v in kept][:limit]
+
+    if song_error:
+        warning = f"Song search unavailable ({song_error}); showing direct video search results instead."
+    elif not song_results:
+        warning = "No song match found for this query; showing direct video search results instead."
+    else:
+        warning = "Found song matches, but none have lyrics available; showing direct video search results instead."
+    if degraded:
+        warning += " Lyrics availability check is also temporarily unavailable; these results are unfiltered."
+
+    return jsonify({"query": query, "mode": "videos", "count": len(kept), "results": kept, "warning": warning})
 
 
 @app.route("/preview")

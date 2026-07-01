@@ -15,6 +15,7 @@
     --accent: #ff4d6d;
     --accent-dim: #7a2536;
     --good: #4dd28c;
+    --warn: #e0a95d;
   }
 
   * { box-sizing: border-box; }
@@ -26,6 +27,8 @@
     color: var(--text);
     min-height: 100vh;
   }
+
+  a { color: var(--accent); }
 
   header {
     padding: 2.5rem 1.5rem 1.5rem;
@@ -83,7 +86,7 @@
   #search-btn:hover { background: #ff2e53; }
 
   main {
-    max-width: 1200px;
+    max-width: 900px;
     margin: 0 auto;
     padding: 2rem 1.5rem 4rem;
   }
@@ -92,10 +95,23 @@
     text-align: center;
     color: var(--muted);
     min-height: 1.5rem;
-    margin-bottom: 1.5rem;
+    margin-bottom: 1rem;
   }
 
   #status.error { color: var(--accent); }
+
+  #warning-banner {
+    display: none;
+    max-width: 100%;
+    margin: 0 0 1.25rem;
+    padding: 0.65rem 1rem;
+    border-radius: 8px;
+    border: 1px solid var(--warn);
+    background: rgba(224, 169, 93, 0.1);
+    color: var(--warn);
+    font-size: 0.85rem;
+    text-align: center;
+  }
 
   .spinner {
     width: 28px;
@@ -109,99 +125,13 @@
 
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-    gap: 1.25rem;
+  #back-to-songs {
+    display: none;
+    margin: 0 0 1rem;
   }
 
-  .card {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-    transition: background 0.15s ease, transform 0.15s ease;
-  }
-
-  .card:hover {
-    background: var(--panel-hover);
-    transform: translateY(-2px);
-  }
-
-  .thumb-wrap {
-    position: relative;
-    width: 100%;
-    aspect-ratio: 16 / 9;
-    background: #000;
-  }
-
-  .thumb-wrap img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    display: block;
-  }
-
-  .duration {
-    position: absolute;
-    bottom: 6px;
-    right: 6px;
-    background: rgba(0, 0, 0, 0.8);
-    color: #fff;
-    font-size: 0.75rem;
-    padding: 2px 6px;
-    border-radius: 4px;
-  }
-
-  .score-badge {
-    position: absolute;
-    top: 6px;
-    left: 6px;
-    background: var(--accent-dim);
-    color: var(--good);
-    font-size: 0.75rem;
-    font-weight: 700;
-    padding: 2px 8px;
-    border-radius: 12px;
-    border: 1px solid var(--good);
-  }
-
-  .card-body {
-    padding: 0.85rem 1rem 1rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.35rem;
-    flex: 1;
-  }
-
-  .title {
-    font-size: 0.95rem;
-    font-weight: 600;
-    line-height: 1.3;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-  }
-
-  .uploader {
-    font-size: 0.8rem;
-    color: var(--muted);
-  }
-
-  .card-actions {
-    margin-top: auto;
-    display: flex;
-    gap: 0.5rem;
-    padding-top: 0.5rem;
-  }
-
-  .card-actions button {
-    flex: 1;
-    padding: 0.5rem;
-    font-size: 0.8rem;
+  #back-to-songs button {
+    padding: 0.5rem 1rem;
     border-radius: 6px;
     border: 1px solid var(--border);
     background: transparent;
@@ -209,14 +139,102 @@
     cursor: pointer;
   }
 
-  .card-actions button:hover {
+  #back-to-songs button:hover {
     border-color: var(--accent);
     color: var(--accent);
   }
 
-  .card-actions button.copied {
-    border-color: var(--good);
+  .list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .song-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.9rem 1.1rem;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+
+  .song-row:hover {
+    background: var(--panel-hover);
+    border-color: var(--accent);
+  }
+
+  .song-info { min-width: 0; }
+
+  .song-title {
+    font-weight: 600;
+    font-size: 1rem;
+  }
+
+  .song-meta {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin-top: 0.15rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .video-row {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.75rem;
+  }
+
+  .video-row img {
+    width: 120px;
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+    border-radius: 6px;
+    flex-shrink: 0;
+    background: #000;
+  }
+
+  .video-info { min-width: 0; flex: 1; }
+
+  .video-title {
+    font-weight: 600;
+    font-size: 0.92rem;
+    line-height: 1.3;
+  }
+
+  .video-meta {
+    color: var(--muted);
+    font-size: 0.8rem;
+    margin-top: 0.25rem;
+  }
+
+  .video-score {
     color: var(--good);
+    font-weight: 700;
+  }
+
+  .video-row button {
+    padding: 0.5rem 0.9rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .video-row button:hover {
+    border-color: var(--accent);
+    color: var(--accent);
   }
 
   .empty-state {
@@ -230,29 +248,48 @@
 
 <header>
   <h1>Home <span>Karaoke</span> Search</h1>
-  <p>Type a song name — karaoke, instrumental, and backing-track versions rise to the top.</p>
-  <p><a href="/songs" style="color: var(--accent);">Search by song name instead &rarr;</a></p>
+  <p>Type a song name — we resolve the exact artist and title, then find a matching karaoke video. Only results with lyrics available are shown.</p>
 </header>
 
 <div class="search-bar">
-  <input id="query" type="text" placeholder="e.g. Bohemian Rhapsody" autofocus autocomplete="off">
+  <input id="query" type="text" placeholder="e.g. Let Her Go Passenger" autofocus autocomplete="off">
   <button id="search-btn">Search</button>
 </div>
 
 <main>
+  <div id="back-to-songs">
+    <button id="back-btn" type="button">&larr; Back to song results</button>
+  </div>
+  <div id="warning-banner"></div>
   <div id="status"></div>
-  <div id="results" class="grid"></div>
+  <div id="results" class="list"></div>
 </main>
 
 <script>
   const queryInput = document.getElementById('query');
   const searchBtn = document.getElementById('search-btn');
   const statusEl = document.getElementById('status');
+  const warningEl = document.getElementById('warning-banner');
   const resultsEl = document.getElementById('results');
+  const backWrap = document.getElementById('back-to-songs');
+  const backBtn = document.getElementById('back-btn');
+
+  let lastSongResults = [];
+  let lastMode = null;
 
   function setStatus(html, isError) {
     statusEl.innerHTML = html;
     statusEl.className = isError ? 'error' : '';
+  }
+
+  function setWarning(message) {
+    if (!message) {
+      warningEl.style.display = 'none';
+      warningEl.textContent = '';
+      return;
+    }
+    warningEl.textContent = message;
+    warningEl.style.display = 'block';
   }
 
   function escapeHtml(str) {
@@ -261,45 +298,44 @@
     return div.innerHTML;
   }
 
-  function formatViews(count) {
-    if (count == null) return '';
-    if (count >= 1_000_000) return (count / 1_000_000).toFixed(1) + 'M views';
-    if (count >= 1_000) return (count / 1_000).toFixed(1) + 'K views';
-    return count + ' views';
+  function formatDuration(seconds) {
+    if (seconds == null) return '';
+    seconds = Math.round(Number(seconds));
+    if (!Number.isFinite(seconds)) return '';
+    const minutes = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${minutes}:${String(secs).padStart(2, '0')}`;
   }
 
-  function extractVideoId(url) {
-    const match = String(url || '').match(/(?:v=|\/videos\/|embed\/|youtu\.be\/|\/v\/|\/shorts\/|\/live\/)([A-Za-z0-9_-]{11})/);
-    return match ? match[1] : '';
-  }
-
-  function renderCard(r) {
-    const thumb = r.thumbnail || '';
-    const duration = r.duration ? `<span class="duration">${escapeHtml(r.duration)}</span>` : '';
-    const views = formatViews(r.view_count);
-    const playerParams = new URLSearchParams({
-      video_id: r.video_id || extractVideoId(r.url),
-      title: r.title || '',
-      artist: r.uploader || '',
-      url: r.url || ''
-    });
-    const playerUrl = `/player?${playerParams.toString()}`;
-
+  function renderSongRow(song) {
+    const meta = [song.album, formatDuration(song.duration_seconds)].filter(Boolean).join(' · ');
     return `
-      <div class="card">
-        <div class="thumb-wrap">
-          ${thumb ? `<img src="${escapeHtml(thumb)}" loading="lazy" alt="">` : ''}
-          <span class="score-badge">★ ${r.score}</span>
-          ${duration}
+      <div class="song-row" data-artist="${escapeHtml(song.artist)}" data-title="${escapeHtml(song.title)}">
+        <div class="song-info">
+          <div class="song-title">${escapeHtml(song.title)} <span style="color: var(--muted);">&mdash; ${escapeHtml(song.artist)}</span></div>
+          ${meta ? `<div class="song-meta">${escapeHtml(meta)}</div>` : ''}
         </div>
-        <div class="card-body">
-          <div class="title" title="${escapeHtml(r.title)}">${escapeHtml(r.title)}</div>
-          <div class="uploader">${escapeHtml(r.uploader)}${views ? ' · ' + views : ''}</div>
-          <div class="card-actions">
-            <button class="open-btn" data-url="${escapeHtml(playerUrl)}">Open Player</button>
-            <button class="copy-btn" data-url="${escapeHtml(r.url)}">Copy URL</button>
-          </div>
+      </div>
+    `;
+  }
+
+  function renderVideoRow(video, artist, title) {
+    const thumb = video.thumbnail || '';
+    const meta = [video.uploader, video.duration].filter(Boolean).join(' · ');
+    const playerParams = new URLSearchParams({
+      video_id: video.video_id || '',
+      title: title,
+      artist: artist,
+      url: video.url || ''
+    });
+    return `
+      <div class="video-row">
+        ${thumb ? `<img src="${escapeHtml(thumb)}" loading="lazy" alt="">` : ''}
+        <div class="video-info">
+          <div class="video-title">${escapeHtml(video.title)}</div>
+          <div class="video-meta"><span class="video-score">&#9733; ${video.score}</span> · ${escapeHtml(meta)}</div>
         </div>
+        <button class="open-btn" data-url="/player?${playerParams.toString()}">Open Player</button>
       </div>
     `;
   }
@@ -308,12 +344,14 @@
     const query = queryInput.value.trim();
     if (!query) return;
 
+    backWrap.style.display = 'none';
     resultsEl.innerHTML = '';
+    setWarning('');
     setStatus('<div class="spinner"></div>', false);
     searchBtn.disabled = true;
 
     try {
-      const res = await fetch(`/search?q=${encodeURIComponent(query)}&limit=12`);
+      const res = await fetch(`/unified-search?q=${encodeURIComponent(query)}&limit=12`);
       const data = await res.json();
 
       if (!res.ok) {
@@ -321,14 +359,33 @@
         return;
       }
 
-      if (!data.results || data.results.length === 0) {
-        setStatus('');
-        resultsEl.innerHTML = `<div class="empty-state">No karaoke results found for "${escapeHtml(query)}". Try a different search.</div>`;
+      setWarning(data.warning || '');
+      lastMode = data.mode;
+
+      if (data.mode === 'songs') {
+        lastSongResults = data.results || [];
+
+        if (lastSongResults.length === 0) {
+          setStatus('');
+          resultsEl.innerHTML = `<div class="empty-state">No songs with lyrics found for "${escapeHtml(query)}". Try a different search.</div>`;
+          return;
+        }
+
+        setStatus(`${lastSongResults.length} song${lastSongResults.length === 1 ? '' : 's'} found — pick one to find a karaoke video`, false);
+        resultsEl.innerHTML = lastSongResults.map(renderSongRow).join('');
         return;
       }
 
-      setStatus(`${data.count} result${data.count === 1 ? '' : 's'} for "${escapeHtml(query)}"`, false);
-      resultsEl.innerHTML = data.results.map(renderCard).join('');
+      // mode === 'videos': already-ranked karaoke videos, one step, no picking a song identity first.
+      const videos = data.results || [];
+      if (videos.length === 0) {
+        setStatus('');
+        resultsEl.innerHTML = `<div class="empty-state">No karaoke videos with lyrics found for "${escapeHtml(query)}". Try a different search.</div>`;
+        return;
+      }
+
+      setStatus(`${videos.length} result${videos.length === 1 ? '' : 's'} for "${escapeHtml(query)}"`, false);
+      resultsEl.innerHTML = videos.map((v) => renderVideoRow(v, v.artist || v.uploader || '', v.clean_title || v.title || '')).join('');
     } catch (err) {
       setStatus('Network error — is the server running?', true);
     } finally {
@@ -336,27 +393,53 @@
     }
   }
 
-  resultsEl.addEventListener('click', async (e) => {
+  async function findKaraokeVideo(artist, title) {
+    resultsEl.innerHTML = '';
+    setWarning('');
+    setStatus('<div class="spinner"></div>', false);
+    backWrap.style.display = 'block';
+
+    try {
+      const params = new URLSearchParams({ artist, title, limit: 12 });
+      const res = await fetch(`/video-search?${params.toString()}`);
+      const data = await res.json();
+
+      if (!res.ok) {
+        setStatus(escapeHtml(data.error || 'Video search failed.'), true);
+        return;
+      }
+
+      if (!data.results || data.results.length === 0) {
+        setStatus('');
+        resultsEl.innerHTML = `<div class="empty-state">No karaoke videos found for "${escapeHtml(title)}" by "${escapeHtml(artist)}".</div>`;
+        return;
+      }
+
+      setStatus(`${data.count} karaoke video${data.count === 1 ? '' : 's'} for "${escapeHtml(title)}" — ${escapeHtml(artist)}`, false);
+      resultsEl.innerHTML = data.results.map((v) => renderVideoRow(v, artist, title)).join('');
+    } catch (err) {
+      setStatus('Network error — is the server running?', true);
+    }
+  }
+
+  resultsEl.addEventListener('click', (e) => {
+    const songRow = e.target.closest('.song-row');
     const openBtn = e.target.closest('.open-btn');
-    const copyBtn = e.target.closest('.copy-btn');
+
+    if (songRow) {
+      findKaraokeVideo(songRow.dataset.artist, songRow.dataset.title);
+    }
 
     if (openBtn) {
       window.location.href = openBtn.dataset.url;
     }
+  });
 
-    if (copyBtn) {
-      try {
-        await navigator.clipboard.writeText(copyBtn.dataset.url);
-        copyBtn.textContent = 'Copied!';
-        copyBtn.classList.add('copied');
-        setTimeout(() => {
-          copyBtn.textContent = 'Copy URL';
-          copyBtn.classList.remove('copied');
-        }, 1500);
-      } catch (err) {
-        copyBtn.textContent = 'Copy failed';
-      }
-    }
+  backBtn.addEventListener('click', () => {
+    backWrap.style.display = 'none';
+    setWarning('');
+    setStatus(`${lastSongResults.length} song${lastSongResults.length === 1 ? '' : 's'} found — pick one to find a karaoke video`, false);
+    resultsEl.innerHTML = lastSongResults.map(renderSongRow).join('');
   });
 
   searchBtn.addEventListener('click', runSearch);

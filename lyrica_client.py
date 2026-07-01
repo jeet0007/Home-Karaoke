@@ -18,6 +18,46 @@ LYRICA_URL = os.environ.get("LYRICA_URL", "http://localhost:5001").rstrip("/")
 TIMEOUT = 10.0
 
 
+class LyricaUnavailableError(Exception):
+    """Raised when Lyrica couldn't be reached or returned something we can't
+    interpret - a network error, timeout, non-200, or unparsable body.
+
+    Deliberately distinct from a confirmed "no lyrics for this song" result
+    (see check_lyrics_available): callers use this distinction to fail open
+    on service trouble instead of treating an outage as "no lyrics exist".
+    """
+
+
+def check_lyrics_available(artist, title, timeout=TIMEOUT):
+    """Return True/False for whether Lyrica has lyrics for artist/title.
+
+    Raises LyricaUnavailableError instead of returning False when we can't get
+    a definitive answer (network error, timeout, bad response) - the caller
+    must not conflate "couldn't check" with "confirmed absent".
+    """
+    params = {"artist": artist, "song": title, "timestamps": "true"}
+    try:
+        response = httpx.get(f"{LYRICA_URL}/lyrics/", params=params, timeout=timeout)
+    except httpx.HTTPError as exc:
+        raise LyricaUnavailableError(f"Lyrica request failed: {exc}") from exc
+
+    if response.status_code != 200:
+        raise LyricaUnavailableError(f"Lyrica returned HTTP {response.status_code}")
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise LyricaUnavailableError("Lyrica returned an unparsable response") from exc
+
+    if payload.get("status") != "success":
+        # Lyrica's documented contract: HTTP 200 + {"status": "error"} means it
+        # looked and found nothing, not that the request failed.
+        return False
+
+    data = payload.get("data") or {}
+    return bool(data.get("timed_lyrics") or data.get("plain_lyrics") or data.get("lyrics"))
+
+
 def _as_time_ms(value):
     try:
         return int(value or 0)

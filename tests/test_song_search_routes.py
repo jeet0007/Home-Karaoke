@@ -109,10 +109,10 @@ class SongSearchRouteTestCase(unittest.TestCase):
         self.assertIn('const songTitle = "Let Her Go"', html)
         self.assertIn('const artist = "Passenger"', html)
 
-    def test_songs_page_renders(self):
+    def test_songs_page_redirects_to_home(self):
         resp = self.client.get("/songs")
-        self.assertEqual(resp.status_code, 200)
-        self.assertIn(b"/song-search", resp.data)
+        self.assertEqual(resp.status_code, 301)
+        self.assertTrue(resp.headers["Location"].endswith("/"))
 
 
 if __name__ == "__main__":
