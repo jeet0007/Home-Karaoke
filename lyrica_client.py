@@ -17,6 +17,43 @@ load_dotenv()
 LYRICA_URL = os.environ.get("LYRICA_URL", "http://localhost:5001").rstrip("/")
 TIMEOUT = 10.0
 
+# Fetcher ids (see Lyrica's fetch_controller.py FETCHER_MAP) requested for a
+# real, post-selection full lyrics fetch via pass=true&sequence=... - this
+# forces Lyrica's PARALLEL/racing path (fetch_controller.py:
+# `use_parallel = len(fetcher_ids) > 1`) instead of the plain-GET default,
+# which walks the same source list SEQUENTIALLY with NO per-fetcher timeout
+# at all. Mirrors DEFAULT_SYNCED_SEQUENCE (LRCLIB, YouTube, NetEase,
+# Megalobiz, Musixmatch, SimpMusic) minus Musixmatch (fetcher id 6):
+# unauthenticated Musixmatch lookups via syncedlyrics are unreliable (see
+# Lyrica's musixmatch_fetcher.py - no MUSIXMATCH_TOKEN configured here), and
+# its search runs in a plain thread-pool executor that Lyrica's outer
+# asyncio.wait_for cancellation can't actually interrupt once it's in
+# flight - a source unlikely to contribute a result isn't worth leaving a
+# stray thread running against Lyrica's own resource-constrained 2-worker
+# gunicorn deployment (see lyrics_filter.py). Set MUSIXMATCH_TOKEN and add
+# ",6" back via this env var if that changes.
+LYRICS_FULL_FETCH_SEQUENCE = os.environ.get("LYRICS_FULL_FETCH_SEQUENCE", "2,3,4,5,7").strip()
+
+# Client-side timeout for the full (post-selection) lyrics fetch above.
+#
+# This is NOT sized off Lyrica's per-fetcher `fetch_with_timeout` cap (12s,
+# fetch_controller.py) - real-repro testing against a live Lyrica instance
+# (see PR description) showed that cap is unenforceable for LRCLIB: its
+# fetcher (lrclib_fetcher.py) does a synchronous, blocking `requests` call,
+# and Lyrica's `maybe_await` (utils.py) invokes fetchers directly rather than
+# via `loop.run_in_executor`, so a slow LRCLIB response blocks Lyrica's
+# entire asyncio event loop for its full duration - `asyncio.wait_for` never
+# gets a chance to cancel it. Measured real-world LRCLIB tail latency of
+# 36-54s confirms the 12s figure is not a reliable bound in practice.
+#
+# What Lyrica DOES reliably enforce, regardless of inner fetcher behavior, is
+# the outer `run_async(fetch_lyrics_controller(...), timeout=60)` in its
+# router.py - past 60s Lyrica itself gives up and returns a 504. This client
+# timeout is set comfortably above that authoritative bound (not the
+# aspirational-but-broken 12s one), so we never cut off a request Lyrica
+# itself is still willing to keep working on.
+FULL_FETCH_TIMEOUT = 70.0
+
 
 class LyricaUnavailableError(Exception):
     """Raised when Lyrica couldn't be reached or returned something we can't
@@ -91,10 +128,23 @@ def _as_time_ms(value):
 
 
 def _fetch_lyrics_data(artist, title):
-    """Hit Lyrica's /lyrics/ endpoint and return its `data` payload, or None."""
-    params = {"artist": artist, "song": title, "timestamps": "true"}
+    """Hit Lyrica's /lyrics/ endpoint in parallel/racing mode across its full
+    synced-lyrics source list (see LYRICS_FULL_FETCH_SEQUENCE) and return its
+    `data` payload, or None.
+
+    Used for real, one-shot lookups on a single confirmed song (get_lyrics,
+    get_lyrics_full) - as opposed to check_lyrics_available's pre-selection
+    checks over many unpicked candidates, which default to a cheaper,
+    narrower mode (see lyrics_filter.py)."""
+    params = {
+        "artist": artist,
+        "song": title,
+        "timestamps": "true",
+        "pass": "true",
+        "sequence": LYRICS_FULL_FETCH_SEQUENCE,
+    }
     try:
-        response = httpx.get(f"{LYRICA_URL}/lyrics/", params=params, timeout=TIMEOUT)
+        response = httpx.get(f"{LYRICA_URL}/lyrics/", params=params, timeout=FULL_FETCH_TIMEOUT)
     except httpx.HTTPError:
         return None
 

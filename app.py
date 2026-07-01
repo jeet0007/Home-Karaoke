@@ -8,9 +8,10 @@ import sys
 import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
-from flask import Flask, Response, jsonify, redirect, render_template, request, stream_with_context, url_for
+from flask import Flask, Response, copy_current_request_context, jsonify, redirect, render_template, request, stream_with_context, url_for
 
 import lyrica_client
 from fallback_search import parse_title_identity_candidates
@@ -383,6 +384,36 @@ def preview():
     return jsonify({"embed_url": f"https://www.youtube.com/embed/{match.group(1)}"})
 
 
+def _fetch_metadata_safe(artist, title):
+    """lyrica_client.get_metadata already fails open (returns {}) on network/
+    parse errors; this only guards against an unexpected exception escaping
+    the worker thread and taking down the other two concurrent lookups."""
+    try:
+        return lyrica_client.get_metadata(artist, title) or {}
+    except Exception:
+        return {}
+
+
+def _fetch_lyrics_safe(artist, title, duration_hint):
+    try:
+        return lyrica_client.get_lyrics_full(artist, title, duration=duration_hint) or {}
+    except Exception:
+        return {}
+
+
+def _prewarm_stream_cache(video_id):
+    """Best-effort background warm of _STREAM_CACHE for the video /select-song
+    just picked, so the frontend's near-certain follow-up /stream-url call
+    often finds a warm cache instead of paying yt-dlp's full cold resolution
+    cost. Fire-and-forget: /select-song does not wait on this thread, and any
+    failure here is silently absorbed - /stream-url falls back to resolving
+    cold itself if this hasn't finished (or failed) in time."""
+    try:
+        _get_upstream_stream_url(video_id)
+    except Exception:
+        pass
+
+
 @app.route("/select-song")
 def select_song():
     """Given a song identity the user picked from /unified-search (artist,
@@ -392,6 +423,12 @@ def select_song():
     the existing karaoke video ranking (search.py) plus a duration-proximity
     bonus/penalty (song_selection.py). The frontend never sees the runner-up
     candidates, only the winner's video_id (or null if nothing was found).
+
+    Metadata, lyrics, and the video search are independent lookups - none
+    consumes another's output (target_duration below only feeds the cheap
+    local pick_best_candidate() call) - so they run concurrently rather than
+    back-to-back, collapsing total latency from roughly their sum to roughly
+    the slowest of the three.
     """
     artist = request.args.get("artist", "").strip()
     title = request.args.get("title", "").strip()
@@ -399,8 +436,23 @@ def select_song():
     if not artist or not title:
         return jsonify({"error": "Missing required query parameters 'artist' and 'title'"}), 400
 
-    metadata = lyrica_client.get_metadata(artist, title) or {}
-    lyrics_result = lyrica_client.get_lyrics_full(artist, title, duration=duration_hint) or {}
+    query = f"{title} {artist}"
+
+    # _run_karaoke_search's error paths call jsonify(), which needs an active
+    # Flask app/request context - not available by default inside a
+    # ThreadPoolExecutor worker thread, so it's wrapped to carry this
+    # request's context over. The other two calls touch no Flask context.
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        metadata_future = executor.submit(_fetch_metadata_safe, artist, title)
+        lyrics_future = executor.submit(_fetch_lyrics_safe, artist, title, duration_hint)
+        search_future = executor.submit(copy_current_request_context(_run_karaoke_search), query, LYRICS_CHECK_CAP)
+
+        metadata = metadata_future.result()
+        lyrics_result = lyrics_future.result()
+        candidates, error = search_future.result()
+
+    if error:
+        return error
 
     # Lyrica's metadata is the authoritative source for the song's real
     # duration (used to score candidate videos below); the caller-supplied
@@ -408,11 +460,6 @@ def select_song():
     target_duration = metadata.get("duration_s")
     if target_duration is None:
         target_duration = duration_hint
-
-    query = f"{title} {artist}"
-    candidates, error = _run_karaoke_search(query, LYRICS_CHECK_CAP)
-    if error:
-        return error
 
     best = pick_best_candidate(candidates, target_duration)
 
@@ -434,6 +481,7 @@ def select_song():
         return jsonify(response)
 
     response["video_id"] = best["video_id"]
+    threading.Thread(target=_prewarm_stream_cache, args=(best["video_id"],), daemon=True).start()
     return jsonify(response)
 
 
