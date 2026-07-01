@@ -416,6 +416,31 @@
     lyricsPanel.innerHTML = '<div class="lyrics-empty">No lyrics found &mdash; enjoy the music!</div>';
   }
 
+  // /select-song's lyrics fetch now runs with a generous timeout (see
+  // lyrica_client.py), but Lyrica itself can still take longer than that to
+  // finish caching a slow source (e.g. a struggling LRCLIB response) - in
+  // that window /select-song already returned with no lyrics. One retry a
+  // few seconds later, straight against Lyrica via the existing /lyrics
+  // route, catches the case where the result showed up moments too late
+  // without holding up the initial response. Best-effort only: on any
+  // failure the "no lyrics" fallback already on screen simply stays.
+  const LYRICS_RETRY_DELAY_MS = 6000;
+
+  async function retryLyricsOnce(artistName, songTitle, durationHint) {
+    try {
+      const params = new URLSearchParams({ artist: artistName, title: songTitle });
+      if (durationHint) params.set('duration', durationHint);
+
+      const res = await fetch(`/lyrics?${params.toString()}`);
+      if (!res.ok) return;
+
+      const data = await res.json();
+      renderLyrics(data.synced);
+    } catch (err) {
+      // Best-effort - leave the existing fallback state as-is.
+    }
+  }
+
   function renderLyrics(syncedLines) {
     const cleaned = (syncedLines || [])
       .filter((line) => Number.isFinite(Number(line.time_ms)) && line.text)
@@ -523,7 +548,11 @@
         coverArt.hidden = false;
       }
 
-      renderLyrics(data.lyrics && data.lyrics.synced);
+      const syncedLines = (data.lyrics && data.lyrics.synced) || [];
+      renderLyrics(syncedLines);
+      if (syncedLines.length === 0) {
+        setTimeout(() => retryLyricsOnce(artist, songTitle, durationHint), LYRICS_RETRY_DELAY_MS);
+      }
 
       if (!data.video_id) {
         setOverlayNoBackingTrack(data.message || 'No backing track found for this song.');

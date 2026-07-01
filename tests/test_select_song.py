@@ -1,5 +1,7 @@
 import os
 import sys
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -125,6 +127,133 @@ class SelectSongRouteTestCase(unittest.TestCase):
         resp = self.client.get("/select-song?artist=Passenger&title=Let+Her+Go")
 
         self.assertEqual(resp.status_code, 502)
+
+
+class SelectSongRunsLookupsConcurrentlyTestCase(unittest.TestCase):
+    """metadata, lyrics, and the karaoke video search are independent lookups
+    - none consumes another's output - so /select-song must run them
+    concurrently. Each mock sleeps for a distinguishable delay; if the route
+    still ran them sequentially, total wall-clock would be close to the sum
+    of all three delays instead of close to the slowest one."""
+
+    def setUp(self):
+        app_module.app.testing = True
+        self.client = app_module.app.test_client()
+
+    @patch("app.karaoke_search.search")
+    @patch("app.lyrica_client.get_lyrics_full")
+    @patch("app.lyrica_client.get_metadata")
+    def test_metadata_lyrics_and_search_run_in_parallel(self, mock_metadata, mock_lyrics, mock_karaoke_search):
+        delay = 0.3
+
+        def slow_metadata(*_args, **_kwargs):
+            time.sleep(delay)
+            return dict(METADATA)
+
+        def slow_lyrics(*_args, **_kwargs):
+            time.sleep(delay)
+            return dict(LYRICS_FULL)
+
+        def slow_search(*_args, **_kwargs):
+            time.sleep(delay)
+            return [CANDIDATE_A]
+
+        mock_metadata.side_effect = slow_metadata
+        mock_lyrics.side_effect = slow_lyrics
+        mock_karaoke_search.side_effect = slow_search
+
+        started = time.monotonic()
+        resp = self.client.get("/select-song?artist=Passenger&title=Let+Her+Go")
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(resp.status_code, 200)
+        # Sequential would take ~3x delay (~0.9s); concurrent should stay
+        # close to 1x delay (~0.3s). 2x delay leaves headroom for thread/test
+        # overhead while still failing if the calls run back-to-back.
+        self.assertLess(elapsed, delay * 2)
+
+    @patch("app.karaoke_search.search")
+    @patch("app.lyrica_client.get_lyrics_full")
+    @patch("app.lyrica_client.get_metadata")
+    def test_a_failing_lookup_does_not_suppress_the_others(self, mock_metadata, mock_lyrics, mock_karaoke_search):
+        # Metadata raising an unexpected exception must not take down the
+        # lyrics/video results that succeeded concurrently alongside it.
+        mock_metadata.side_effect = RuntimeError("boom")
+        mock_lyrics.return_value = dict(LYRICS_FULL)
+        mock_karaoke_search.return_value = [CANDIDATE_A]
+
+        resp = self.client.get("/select-song?artist=Passenger&title=Let+Her+Go")
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["cover_art"], "")
+        self.assertEqual(data["lyrics"]["synced"], LYRICS_FULL["synced"])
+        self.assertEqual(data["video_id"], "aaa")
+
+
+class SelectSongPrewarmsStreamCacheTestCase(unittest.TestCase):
+    """/select-song already knows the winning video_id before it returns;
+    it should fire a best-effort background resolution of that video's
+    stream URL so the frontend's near-certain following /stream-url call
+    often finds a warm _STREAM_CACHE entry - without making /select-song
+    itself wait on that resolution."""
+
+    def setUp(self):
+        app_module.app.testing = True
+        self.client = app_module.app.test_client()
+        with app_module._STREAM_CACHE_LOCK:
+            app_module._STREAM_CACHE.clear()
+
+    @patch("app.karaoke_search.search")
+    @patch("app.lyrica_client.get_lyrics_full")
+    @patch("app.lyrica_client.get_metadata")
+    @patch("app._get_upstream_stream_url")
+    def test_does_not_block_on_the_background_prewarm(
+        self, mock_resolve, mock_metadata, mock_lyrics, mock_karaoke_search
+    ):
+        mock_metadata.return_value = dict(METADATA)
+        mock_lyrics.return_value = dict(LYRICS_FULL)
+        mock_karaoke_search.return_value = [CANDIDATE_A]
+
+        started_resolve = threading.Event()
+        release_resolve = threading.Event()
+
+        def blocking_resolve(video_id, *args, **kwargs):
+            started_resolve.set()
+            release_resolve.wait(timeout=2)
+            return f"https://example.com/{video_id}", None
+
+        mock_resolve.side_effect = blocking_resolve
+
+        resp = self.client.get("/select-song?artist=Passenger&title=Let+Her+Go")
+
+        # The response already came back even though blocking_resolve may
+        # still be parked on release_resolve.wait() - proving /select-song
+        # did not wait on it synchronously.
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["video_id"], "aaa")
+
+        self.assertTrue(started_resolve.wait(timeout=2), "background prewarm was never triggered")
+        mock_resolve.assert_called_once_with("aaa")
+        release_resolve.set()
+
+    @patch("app.karaoke_search.search")
+    @patch("app.lyrica_client.get_lyrics_full")
+    @patch("app.lyrica_client.get_metadata")
+    @patch("app._get_upstream_stream_url")
+    def test_no_backing_track_found_does_not_trigger_a_prewarm(
+        self, mock_resolve, mock_metadata, mock_lyrics, mock_karaoke_search
+    ):
+        mock_metadata.return_value = dict(METADATA)
+        mock_lyrics.return_value = dict(LYRICS_FULL)
+        mock_karaoke_search.return_value = []
+
+        resp = self.client.get("/select-song?artist=Passenger&title=Let+Her+Go")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.get_json()["video_id"])
+        time.sleep(0.1)
+        mock_resolve.assert_not_called()
 
 
 if __name__ == "__main__":
