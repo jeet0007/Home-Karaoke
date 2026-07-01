@@ -11,6 +11,15 @@ python app.py
 
 Then open http://localhost:5000 in your browser.
 
+The main app binds to `127.0.0.1:5000` by default. Set `APP_PORT` or `APP_HOST` to change that:
+
+```bash
+APP_PORT=5050 python app.py
+```
+
+On macOS, port 5000 is commonly used by AirPlay Receiver (`ControlCenter`). If startup says port 5000
+is already in use, set `APP_PORT=<other port>` and retry, or free port 5000 in System Settings.
+
 ## Lyrics
 
 Lyrics and song metadata are served through a [Lyrica](https://github.com/Wilooper/Lyrica) sidecar — a
@@ -27,8 +36,9 @@ git clone https://github.com/Wilooper/Lyrica sidecar/lyrica
 ```
 
 This installs Lyrica's own dependencies, starts it on port 5001, waits for it to come up, then starts
-this app on port 5000. Set `LYRICA_PORT` to change the sidecar's port, or `LYRICA_URL` to point at an
-already-running / remote Lyrica instance instead (e.g. `LYRICA_URL=https://wilooper-lyrica.hf.space`).
+this app on port 5000. Set `APP_PORT` or `APP_HOST` to change this app's bind address. Set
+`LYRICA_PORT` to change the sidecar's port, or `LYRICA_URL` to point at an already-running / remote
+Lyrica instance instead (e.g. `LYRICA_URL=https://wilooper-lyrica.hf.space`).
 
 If `sidecar/lyrica` isn't present, `start.sh` skips it and only starts the main app — `/lyrics` and
 `/metadata` will then respond with 404s, but `/search` and `/preview` keep working normally.

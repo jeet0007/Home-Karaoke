@@ -13,6 +13,24 @@ import app as app_module  # noqa: E402
 VIDEO_ID = "dQw4w9WgXcQ"
 
 
+class AppConfigTestCase(unittest.TestCase):
+    def test_resolve_host_port_defaults(self):
+        self.assertEqual(app_module._resolve_host_port({}), ("127.0.0.1", 5000))
+
+    def test_resolve_host_port_uses_env_values(self):
+        env = {"APP_HOST": "0.0.0.0", "APP_PORT": "5050"}
+
+        self.assertEqual(app_module._resolve_host_port(env), ("0.0.0.0", 5050))
+
+    def test_resolve_host_port_rejects_non_numeric_port(self):
+        with self.assertRaisesRegex(ValueError, "Invalid APP_PORT='abc'"):
+            app_module._resolve_host_port({"APP_PORT": "abc"})
+
+    def test_resolve_host_port_rejects_out_of_range_port(self):
+        with self.assertRaisesRegex(ValueError, "Invalid APP_PORT=70000"):
+            app_module._resolve_host_port({"APP_PORT": "70000"})
+
+
 class StreamProxyTestCase(unittest.TestCase):
     def setUp(self):
         app_module.app.testing = True
