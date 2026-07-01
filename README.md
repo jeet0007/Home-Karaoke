@@ -11,6 +11,49 @@ python app.py
 
 Then open http://localhost:5000 in your browser.
 
+## Lyrics
+
+Lyrics and song metadata are served through a [Lyrica](https://github.com/Wilooper/Lyrica) sidecar — a
+separate lyrics API we run locally and call over HTTP. It is not vendored in this repo; clone it once:
+
+```bash
+git clone https://github.com/Wilooper/Lyrica sidecar/lyrica
+```
+
+### Running with the sidecar
+
+```bash
+./start.sh
+```
+
+This installs Lyrica's own dependencies, starts it on port 5001, waits for it to come up, then starts
+this app on port 5000. Set `LYRICA_PORT` to change the sidecar's port, or `LYRICA_URL` to point at an
+already-running / remote Lyrica instance instead (e.g. `LYRICA_URL=https://wilooper-lyrica.hf.space`).
+
+If `sidecar/lyrica` isn't present, `start.sh` skips it and only starts the main app — `/lyrics` and
+`/metadata` will then respond with 404s, but `/search` and `/preview` keep working normally.
+
+### Endpoints
+
+```
+GET /lyrics?artist=<str>&title=<str>&duration=<int>
+  → 200 {"synced": [{"time_ms": int, "text": str}, ...], "plain": "...", "source": "lrclib"}
+  → 404 {"error": "no lyrics found"}
+```
+
+`synced` is `[]` when Lyrica has no timestamped (LRC) version for the song, even if `plain` is
+non-empty. `duration` is accepted but currently unused — Lyrica's `/lyrics/` endpoint has no way to
+disambiguate by track length.
+
+```
+GET /metadata?artist=<str>&title=<str>
+  → 200 {"cover_art": url, "genre": str, "duration_s": int, "release_date": str, ...}
+  → 404 {"error": "no metadata found"}
+```
+
+`genre` is derived from Lyrica's `tags` list (comma-joined); other fields Lyrica returns (album,
+popularity, links, etc.) are passed through as-is.
+
 ## Notes
 
 - Search is powered by the bundled `binaries/yt-dlp` binary (already included in this repo) — no separate yt-dlp install is required for search itself, though `yt-dlp` is still listed in `requirements.txt` as a Python fallback/dependency.
