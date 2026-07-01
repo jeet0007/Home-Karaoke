@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ title }} - {{ artist }} | Home Karaoke</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #181b22;
+    --panel-hover: #20242e;
+    --border: #2a2e38;
+    --text: #e8e9ed;
+    --muted: #8b8fa3;
+    --accent: #ff4d6d;
+    --accent-dim: #7a2536;
+    --good: #4dd28c;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  button {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    border-radius: 8px;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 600;
+  }
+
+  button:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--panel-hover);
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  .page {
+    width: min(1100px, calc(100% - 2rem));
+    margin: 0 auto;
+    padding: 1.25rem 0 2rem;
+  }
+
+  .topbar {
+    display: grid;
+    grid-template-columns: minmax(8rem, auto) 1fr minmax(8rem, auto);
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 1rem;
+  }
+
+  .back-link {
+    color: var(--muted);
+    font-size: 0.92rem;
+  }
+
+  .back-link:hover { color: var(--accent); }
+
+  .song-heading {
+    min-width: 0;
+    text-align: center;
+  }
+
+  .song-heading h1 {
+    margin: 0;
+    font-size: 1.25rem;
+    font-weight: 700;
+    line-height: 1.25;
+    overflow-wrap: anywhere;
+  }
+
+  .song-heading span { color: var(--muted); }
+
+  .player-shell {
+    position: relative;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: #000;
+    aspect-ratio: 16 / 9;
+  }
+
+  video {
+    width: 100%;
+    height: 100%;
+    display: block;
+    object-fit: contain;
+    background: #000;
+  }
+
+  .overlay {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    padding: 1.5rem;
+    text-align: center;
+    background: rgba(15, 17, 21, 0.78);
+  }
+
+  .overlay[hidden] { display: none; }
+
+  .spinner {
+    width: 34px;
+    height: 34px;
+    margin: 0 auto 0.85rem;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .overlay-title {
+    margin: 0 0 0.35rem;
+    font-weight: 700;
+  }
+
+  .overlay-copy {
+    margin: 0;
+    color: var(--muted);
+    line-height: 1.45;
+  }
+
+  .overlay-copy a {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin: 0.85rem 0 1rem;
+    flex-wrap: wrap;
+  }
+
+  .controls button {
+    min-width: 5.75rem;
+    min-height: 2.4rem;
+    padding: 0.55rem 0.85rem;
+  }
+
+  .volume-group {
+    display: flex;
+    gap: 0.4rem;
+  }
+
+  .volume-group button {
+    min-width: 3.25rem;
+  }
+
+  .score {
+    margin-left: auto;
+    min-height: 2.4rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.45rem 0.85rem;
+    border: 1px solid var(--good);
+    border-radius: 999px;
+    background: var(--accent-dim);
+    color: var(--good);
+    font-weight: 800;
+  }
+
+  .lyrics-panel {
+    height: clamp(260px, 34vh, 420px);
+    overflow-y: auto;
+    padding: 2rem 1rem;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+    scroll-behavior: smooth;
+  }
+
+  .lyrics-empty {
+    min-height: 100%;
+    display: grid;
+    place-items: center;
+    color: var(--muted);
+    text-align: center;
+  }
+
+  .lyric-line {
+    max-width: 850px;
+    margin: 0 auto;
+    padding: 0.52rem 0.75rem;
+    border-radius: 8px;
+    color: var(--muted);
+    font-size: 1.08rem;
+    line-height: 1.45;
+    text-align: center;
+    transition: color 0.15s ease, opacity 0.15s ease, background 0.15s ease, transform 0.15s ease;
+  }
+
+  .lyric-line.past {
+    opacity: 0.42;
+  }
+
+  .lyric-line.current {
+    color: var(--accent);
+    background: rgba(255, 77, 109, 0.08);
+    opacity: 1;
+    transform: scale(1.03);
+    font-weight: 800;
+  }
+
+  .lyric-line.upcoming {
+    opacity: 0.72;
+  }
+
+  @media (max-width: 680px) {
+    .page {
+      width: min(100% - 1rem, 1100px);
+      padding-top: 0.85rem;
+    }
+
+    .topbar {
+      grid-template-columns: 1fr;
+      gap: 0.55rem;
+    }
+
+    .song-heading {
+      text-align: left;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+    }
+
+    .volume-group {
+      grid-column: span 2;
+    }
+
+    .volume-group button {
+      flex: 1;
+    }
+
+    .score {
+      grid-column: span 2;
+      justify-content: center;
+      margin-left: 0;
+    }
+  }
+</style>
+</head>
+<body>
+
+<main class="page">
+  <div class="topbar">
+    <a class="back-link" href="/">Back to search</a>
+    <div class="song-heading">
+      <h1>{{ title }} <span>&mdash; {{ artist }}</span></h1>
+    </div>
+    <div aria-hidden="true"></div>
+  </div>
+
+  <section class="player-shell" aria-label="Karaoke video player">
+    <video id="video" crossorigin="anonymous" autoplay muted playsinline></video>
+    <div id="video-overlay" class="overlay">
+      <div>
+        <div class="spinner" aria-hidden="true"></div>
+        <p class="overlay-title">Loading karaoke video</p>
+        <p class="overlay-copy">Resolving the playable stream...</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="controls" aria-label="Playback controls">
+    <button id="play-pause" type="button" disabled>Play</button>
+    <button id="restart" type="button" disabled>Restart</button>
+    <div class="volume-group" aria-label="Volume controls">
+      <button id="volume-down" type="button" disabled>Vol -</button>
+      <button id="volume-up" type="button" disabled>Vol +</button>
+    </div>
+    <div class="score" aria-label="Score">Score: <span>★ --</span></div>
+  </section>
+
+  <section id="lyrics-panel" class="lyrics-panel" aria-live="polite">
+    <div class="lyrics-empty">Loading lyrics...</div>
+  </section>
+</main>
+
+<script>
+  const videoId = {{ video_id|tojson }};
+  const songTitle = {{ title|tojson }};
+  const artist = {{ artist|tojson }};
+  const youtubeUrl = {{ url|tojson }};
+
+  const video = document.getElementById('video');
+  const overlay = document.getElementById('video-overlay');
+  const playPauseBtn = document.getElementById('play-pause');
+  const restartBtn = document.getElementById('restart');
+  const volumeDownBtn = document.getElementById('volume-down');
+  const volumeUpBtn = document.getElementById('volume-up');
+  const lyricsPanel = document.getElementById('lyrics-panel');
+
+  let lyrics = [];
+  let lyricNodes = [];
+  let currentLyricIndex = -1;
+  let animationFrameId = null;
+
+  function setOverlayLoading(message) {
+    overlay.hidden = false;
+    overlay.innerHTML = `
+      <div>
+        <div class="spinner" aria-hidden="true"></div>
+        <p class="overlay-title">Loading karaoke video</p>
+        <p class="overlay-copy">${message}</p>
+      </div>
+    `;
+  }
+
+  function setOverlayError(message) {
+    overlay.hidden = false;
+    overlay.innerHTML = '';
+
+    const wrap = document.createElement('div');
+    const title = document.createElement('p');
+    const copy = document.createElement('p');
+    const link = document.createElement('a');
+
+    title.className = 'overlay-title';
+    title.textContent = 'Could not load this video here';
+    copy.className = 'overlay-copy';
+    copy.textContent = `${message} `;
+    link.href = youtubeUrl;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.textContent = 'Open it on YouTube.';
+
+    copy.appendChild(link);
+    wrap.append(title, copy);
+    overlay.appendChild(wrap);
+  }
+
+  function enableControls() {
+    [playPauseBtn, restartBtn, volumeDownBtn, volumeUpBtn].forEach((button) => {
+      button.disabled = false;
+    });
+  }
+
+  function setPlayButton() {
+    playPauseBtn.textContent = video.paused ? 'Play' : 'Pause';
+  }
+
+  async function togglePlayback() {
+    if (!video.src) return;
+
+    video.muted = false;
+    if (video.paused) {
+      try {
+        await video.play();
+      } catch (err) {
+        setOverlayError('The browser blocked playback until you interact with the page.');
+      }
+    } else {
+      video.pause();
+    }
+    setPlayButton();
+  }
+
+  async function restartVideo() {
+    if (!video.src) return;
+
+    video.muted = false;
+    video.currentTime = 0;
+    currentLyricIndex = -1;
+    updateCurrentLyric(0);
+    try {
+      await video.play();
+    } catch (err) {
+      setOverlayError('The browser blocked playback until you interact with the page.');
+    }
+    setPlayButton();
+  }
+
+  function changeVolume(delta) {
+    video.muted = false;
+    video.volume = Math.max(0, Math.min(1, video.volume + delta));
+  }
+
+  function showLyricsFallback() {
+    lyricsPanel.innerHTML = '<div class="lyrics-empty">No lyrics found &mdash; enjoy the video!</div>';
+  }
+
+  async function loadLyrics() {
+    try {
+      const params = new URLSearchParams({ artist, title: songTitle });
+      const res = await fetch(`/lyrics?${params.toString()}`);
+      if (!res.ok) {
+        showLyricsFallback();
+        return;
+      }
+
+      const data = await res.json();
+      if (!Array.isArray(data.synced) || data.synced.length === 0) {
+        showLyricsFallback();
+        return;
+      }
+
+      lyrics = data.synced
+        .filter((line) => Number.isFinite(Number(line.time_ms)) && line.text)
+        .map((line) => ({ time_ms: Number(line.time_ms), text: String(line.text) }))
+        .sort((a, b) => a.time_ms - b.time_ms);
+
+      if (lyrics.length === 0) {
+        showLyricsFallback();
+        return;
+      }
+
+      lyricsPanel.innerHTML = '';
+      lyricNodes = lyrics.map((line) => {
+        const node = document.createElement('div');
+        node.className = 'lyric-line upcoming';
+        node.textContent = line.text;
+        lyricsPanel.appendChild(node);
+        return node;
+      });
+    } catch (err) {
+      showLyricsFallback();
+    }
+  }
+
+  function findCurrentLyricIndex(nowMs) {
+    let low = 0;
+    let high = lyrics.length - 1;
+    let result = -1;
+
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      if (lyrics[mid].time_ms <= nowMs) {
+        result = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+
+    return result;
+  }
+
+  function updateCurrentLyric(nowMs) {
+    if (lyrics.length === 0) return;
+
+    const nextIndex = findCurrentLyricIndex(nowMs);
+    if (nextIndex === currentLyricIndex) return;
+
+    currentLyricIndex = nextIndex;
+    lyricNodes.forEach((node, index) => {
+      node.classList.toggle('past', index < currentLyricIndex);
+      node.classList.toggle('current', index === currentLyricIndex);
+      node.classList.toggle('upcoming', index > currentLyricIndex);
+    });
+
+    if (currentLyricIndex >= 0) {
+      lyricNodes[currentLyricIndex].scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }
+
+  function syncLyrics() {
+    updateCurrentLyric(video.currentTime * 1000);
+    animationFrameId = requestAnimationFrame(syncLyrics);
+  }
+
+  async function loadStream() {
+    setOverlayLoading('Resolving the playable stream...');
+
+    try {
+      const res = await fetch(`/stream-url?video_id=${encodeURIComponent(videoId)}`);
+      const data = await res.json();
+      if (!res.ok || !data.stream_url) {
+        throw new Error(data.error || 'The stream URL could not be resolved.');
+      }
+
+      if (data.warning) {
+        console.warn(data.warning);
+      }
+
+      video.src = data.stream_url;
+      video.load();
+      overlay.hidden = true;
+      enableControls();
+    } catch (err) {
+      setOverlayError(err.message || 'The stream URL could not be resolved.');
+    }
+  }
+
+  playPauseBtn.addEventListener('click', togglePlayback);
+  restartBtn.addEventListener('click', restartVideo);
+  volumeDownBtn.addEventListener('click', () => changeVolume(-0.1));
+  volumeUpBtn.addEventListener('click', () => changeVolume(0.1));
+
+  video.addEventListener('play', setPlayButton);
+  video.addEventListener('pause', setPlayButton);
+  video.addEventListener('ended', setPlayButton);
+  video.addEventListener('error', () => {
+    setOverlayError('The resolved stream was rejected by the browser or expired.');
+  });
+
+  document.addEventListener('keydown', (e) => {
+    const tagName = e.target.tagName;
+    if (tagName === 'INPUT' || tagName === 'TEXTAREA' || e.target.isContentEditable) return;
+
+    if (e.code === 'Space') {
+      e.preventDefault();
+      togglePlayback();
+    } else if (e.key.toLowerCase() === 'r') {
+      restartVideo();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      changeVolume(0.1);
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      changeVolume(-0.1);
+    }
+  });
+
+  // TODO: wire to /grade WebSocket when audio grading is built
+
+  loadStream();
+  loadLyrics();
+  animationFrameId = requestAnimationFrame(syncLyrics);
+  window.addEventListener('beforeunload', () => cancelAnimationFrame(animationFrameId));
+</script>
+
+</body>
+</html>

@@ -267,10 +267,22 @@
     return count + ' views';
   }
 
+  function extractVideoId(url) {
+    const match = String(url || '').match(/(?:v=|\/videos\/|embed\/|youtu\.be\/|\/v\/|\/shorts\/|\/live\/)([A-Za-z0-9_-]{11})/);
+    return match ? match[1] : '';
+  }
+
   function renderCard(r) {
     const thumb = r.thumbnail || '';
     const duration = r.duration ? `<span class="duration">${escapeHtml(r.duration)}</span>` : '';
     const views = formatViews(r.view_count);
+    const playerParams = new URLSearchParams({
+      video_id: r.video_id || extractVideoId(r.url),
+      title: r.title || '',
+      artist: r.uploader || '',
+      url: r.url || ''
+    });
+    const playerUrl = `/player?${playerParams.toString()}`;
 
     return `
       <div class="card">
@@ -283,7 +295,7 @@
           <div class="title" title="${escapeHtml(r.title)}">${escapeHtml(r.title)}</div>
           <div class="uploader">${escapeHtml(r.uploader)}${views ? ' · ' + views : ''}</div>
           <div class="card-actions">
-            <button class="open-btn" data-url="${escapeHtml(r.url)}">Open in YouTube</button>
+            <button class="open-btn" data-url="${escapeHtml(playerUrl)}">Open Player</button>
             <button class="copy-btn" data-url="${escapeHtml(r.url)}">Copy URL</button>
           </div>
         </div>
@@ -328,7 +340,7 @@
     const copyBtn = e.target.closest('.copy-btn');
 
     if (openBtn) {
-      window.open(openBtn.dataset.url, '_blank', 'noopener');
+      window.location.href = openBtn.dataset.url;
     }
 
     if (copyBtn) {
