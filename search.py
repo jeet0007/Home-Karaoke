@@ -10,7 +10,6 @@ BINARY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "binaries
 # Substrings checked against the lowercased title.
 BOOST_KEYWORDS = {
     "karaoke": 15,
-    "lyrics": 10,
     "instrumental": 10,
     "backing track": 10,
     "no vocals": 10,
