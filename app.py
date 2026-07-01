@@ -21,6 +21,9 @@ from song_selection import pick_best_candidate
 
 LYRICS_CHECK_CAP = 15
 UNIFIED_SEARCH_DEFAULT_LIMIT = 12
+SUGGESTIONS_DEFAULT_LIMIT = 8
+SUGGESTIONS_MAX_LIMIT = 10
+SUGGESTIONS_MIN_QUERY_LENGTH = 2
 
 app = Flask(__name__)
 karaoke_search = KaraokeSearch()
@@ -208,6 +211,32 @@ def song_search_route():
 
     limit = request.args.get("limit", 10, type=int) or 10
     limit = max(1, min(limit, LYRICS_CHECK_CAP))
+
+    try:
+        results = song_search.search(query, limit=limit)
+    except SongSearchError as exc:
+        return jsonify({"error": str(exc)}), exc.status_code
+
+    return jsonify({"query": query, "count": len(results), "results": results})
+
+
+@app.route("/song-suggestions")
+def song_suggestions():
+    """Fast typeahead suggestions as the user types, deliberately with NO
+    lyrics-availability filtering.
+
+    /unified-search is slow because it lyrics-checks every ytmusicapi
+    candidate against Lyrica before returning anything. This endpoint exists
+    so the frontend can offer the user an exact song to pick (routed straight
+    into /select-song) before that expensive fan-out ever runs - it's a thin,
+    unfiltered wrapper around song_search.search().
+    """
+    query = request.args.get("q", "").strip()
+    if len(query) < SUGGESTIONS_MIN_QUERY_LENGTH:
+        return jsonify({"query": query, "count": 0, "results": []})
+
+    limit = request.args.get("limit", SUGGESTIONS_DEFAULT_LIMIT, type=int) or SUGGESTIONS_DEFAULT_LIMIT
+    limit = max(1, min(limit, SUGGESTIONS_MAX_LIMIT))
 
     try:
         results = song_search.search(query, limit=limit)
