@@ -4,6 +4,7 @@ import re
 
 from flask import Flask, jsonify, render_template, request
 
+import lyrica_client
 from search import KaraokeSearch
 
 app = Flask(__name__)
@@ -51,6 +52,35 @@ def preview():
         return jsonify({"error": "Could not extract a video id from that URL"}), 400
 
     return jsonify({"embed_url": f"https://www.youtube.com/embed/{match.group(1)}"})
+
+
+@app.route("/lyrics")
+def lyrics():
+    artist = request.args.get("artist", "").strip()
+    title = request.args.get("title", "").strip()
+    duration = request.args.get("duration", type=int)
+    if not artist or not title:
+        return jsonify({"error": "Missing required query parameters 'artist' and 'title'"}), 400
+
+    result = lyrica_client.get_lyrics_full(artist, title, duration=duration)
+    if not result:
+        return jsonify({"error": "no lyrics found"}), 404
+
+    return jsonify(result)
+
+
+@app.route("/metadata")
+def metadata():
+    artist = request.args.get("artist", "").strip()
+    title = request.args.get("title", "").strip()
+    if not artist or not title:
+        return jsonify({"error": "Missing required query parameters 'artist' and 'title'"}), 400
+
+    result = lyrica_client.get_metadata(artist, title)
+    if not result:
+        return jsonify({"error": "no metadata found"}), 404
+
+    return jsonify(result)
 
 
 if __name__ == "__main__":
