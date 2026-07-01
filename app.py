@@ -1,5 +1,6 @@
 """Minimal Flask GUI for karaoke-exclusive YouTube search."""
 
+import json
 import os
 import re
 import socket
@@ -10,9 +11,13 @@ import time
 import urllib.parse
 
 import httpx
+import numpy as np
 from flask import Flask, Response, jsonify, redirect, render_template, request, stream_with_context, url_for
+from flask_sock import Sock
+from simple_websocket import ConnectionClosed
 
 import lyrica_client
+from audio_grading import RealtimeGrader
 from fallback_search import parse_title_identity_candidates
 from lyrics_filter import filter_candidates_by_lyrics
 from search import KaraokeSearch
@@ -24,8 +29,15 @@ UNIFIED_SEARCH_DEFAULT_LIMIT = 12
 SUGGESTIONS_DEFAULT_LIMIT = 8
 SUGGESTIONS_MAX_LIMIT = 10
 SUGGESTIONS_MIN_QUERY_LENGTH = 2
+GRADE_MIN_SAMPLE_RATE = 8000
+GRADE_MAX_SAMPLE_RATE = 192000
 
 app = Flask(__name__)
+# flask-sock upgrades a request to a raw WebSocket in-place on Werkzeug's dev
+# server (via simple-websocket/wsproto) - no separate ASGI server or
+# gunicorn/eventlet swap needed, so this coexists with app.run(threaded=True)
+# below and with /stream-proxy's Range-request streaming untouched.
+sock = Sock(app)
 karaoke_search = KaraokeSearch()
 song_search = SongSearch()
 BINARY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "binaries", "yt-dlp")
@@ -530,6 +542,60 @@ def stream_proxy(video_id):
     headers["Cache-Control"] = "no-store"
 
     return Response(stream_with_context(generate()), status=upstream.status_code, headers=headers)
+
+
+@sock.route("/grade")
+def grade(ws):
+    """Streams live pitch/energy performance scores while the user sings
+    along to the backing track - see audio_grading.py for what this scores
+    (and, just as importantly, what it does NOT: there's no isolated
+    reference vocal to compare against, so this is not melody-accuracy
+    grading against the original song).
+
+    Protocol: the client's first message must be a JSON text frame
+    {"sample_rate": <int>} matching the AudioContext sample rate it
+    captured at. Every message after that is a binary frame of raw
+    little-endian float32 mono PCM samples. The server replies with one
+    JSON text frame per score update produced (a few times a second),
+    shaped like audio_grading.RealtimeGrader.push_samples()'s output.
+    """
+    try:
+        handshake_raw = ws.receive()
+        if handshake_raw is None:
+            return
+
+        try:
+            handshake = json.loads(handshake_raw)
+            sample_rate = int(handshake["sample_rate"])
+            if not (GRADE_MIN_SAMPLE_RATE <= sample_rate <= GRADE_MAX_SAMPLE_RATE):
+                raise ValueError("sample_rate out of range")
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            ws.send(json.dumps({"error": 'First message must be JSON {"sample_rate": <int>}'}))
+            return
+
+        grader = RealtimeGrader(sample_rate)
+
+        while True:
+            message = ws.receive()
+            if message is None:
+                break
+            if isinstance(message, str):
+                # Ignore stray text frames (e.g. a client-side keepalive)
+                # rather than tearing down the session over a non-PCM
+                # message.
+                continue
+
+            try:
+                samples = np.frombuffer(message, dtype=np.float32)
+            except ValueError:
+                # Malformed/truncated frame (not a multiple of 4 bytes) -
+                # drop it and keep grading rather than killing the session.
+                continue
+
+            for update in grader.push_samples(samples):
+                ws.send(json.dumps(update))
+    except ConnectionClosed:
+        pass
 
 
 @app.route("/lyrics")
