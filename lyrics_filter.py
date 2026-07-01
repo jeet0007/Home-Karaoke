@@ -13,20 +13,69 @@ search returned; anything beyond the cap is dropped, not silently kept.
 Three outcomes per candidate, from lyrica_client.check_lyrics_available:
   - lyrics confirmed available -> kept
   - Lyrica explicitly reports no match -> dropped (the point of this filter)
-  - Lyrica errored/unreachable -> kept anyway (fail open), since a Lyrica
-    outage filtering every result down to zero would be worse than an
-    unfiltered result set. If EVERY candidate in a batch errors, that's a
-    strong signal Lyrica itself is down/misconfigured (vs. these particular
-    songs lacking lyrics) - callers surface that via the `degraded` flag.
+  - Lyrica errored/unreachable (network failure, timeout, unparsable
+    response) -> ALSO dropped. This product's requirement is strict: "no
+    lyrics available" and "couldn't confirm lyrics are available" must both
+    exclude a candidate, since a user who opens the player expects lyrics to
+    actually be there. A per-candidate error gets one bounded retry first
+    (see MAX_TIMEOUT_RETRIES) if the error was specifically a timeout, to
+    absorb a transient blip without paying the cost of a second full outage
+    round trip on every other error type.
+
+    We deliberately do NOT fail a whole batch open just because one
+    candidate's check errored - that conflates "this one song's check had a
+    hiccup" with "Lyrica itself is down." Instead, a `degraded` flag is
+    raised at the batch level when a large fraction of checks in the same
+    batch error (see DEGRADED_ERROR_RATIO below), which is the actual signal
+    that something systemic (Lyrica down/misconfigured/rate-limiting) is
+    going on rather than one flaky candidate.
 """
 
 from concurrent.futures import ThreadPoolExecutor
+
+import httpx
 
 import lyrica_client
 
 DEFAULT_CHECK_CAP = 15
 DEFAULT_PER_CHECK_TIMEOUT = 6.0
 DEFAULT_MAX_WORKERS = 8
+
+# One bounded retry for a timeout specifically (not other error types - see
+# module docstring): timeouts are the shape of error most likely to be a
+# transient blip (momentary slow upstream source, brief rate limiting) and
+# most likely to reoccur if we don't retry at all. Non-timeout errors
+# (connection refused, HTTP 5xx, unparsable body) are far more likely to be
+# either a real outage or a persistent bug, where a second attempt within
+# the same request just spends latency without changing the outcome.
+MAX_TIMEOUT_RETRIES = 1
+
+# Fraction of *checked* candidates that must error before we call the batch
+# "degraded" (Lyrica itself likely down/misconfigured) rather than treating
+# each error as that one candidate's problem. 0.7 is chosen to require a
+# clear majority-plus: candidates in a batch hit Lyrica independently (often
+# different songs, sometimes different upstream lyrics sources), so a batch
+# where most of them fail together is far more consistent with a shared
+# failure point (Lyrica process down, network path broken, rate limited)
+# than with several unrelated songs coincidentally erroring at once. A
+# single stray error (or even a few, in a batch of 15) stays well under this
+# ratio and is handled as an ordinary per-candidate exclusion instead.
+DEGRADED_ERROR_RATIO = 0.7
+
+
+def _check_lyrics_with_retry(artist, title, timeout):
+    """Call lyrica_client.check_lyrics_available, retrying once if (and only
+    if) the failure was a timeout. Re-raises LyricaUnavailableError if every
+    attempt fails."""
+    attempts = MAX_TIMEOUT_RETRIES + 1
+    for attempt in range(attempts):
+        try:
+            return lyrica_client.check_lyrics_available(artist, title, timeout=timeout)
+        except lyrica_client.LyricaUnavailableError as exc:
+            is_timeout = isinstance(exc.__cause__, httpx.TimeoutException)
+            if attempt < attempts - 1 and is_timeout:
+                continue
+            raise
 
 
 def _check_one(candidate, identity_fn, timeout):
@@ -39,7 +88,7 @@ def _check_one(candidate, identity_fn, timeout):
         if not artist or not title:
             continue
         try:
-            if lyrica_client.check_lyrics_available(artist, title, timeout=timeout):
+            if _check_lyrics_with_retry(artist, title, timeout):
                 return candidate, "has_lyrics", (artist, title)
         except lyrica_client.LyricaUnavailableError:
             saw_error = True
@@ -68,8 +117,17 @@ def filter_candidates_by_lyrics(
     a clean artist/title. Candidates beyond `cap` are dropped, not returned
     unchecked.
 
-    `degraded` is True only when every checked candidate errored out -
-    treated as "Lyrica itself is unreachable", not "nothing has lyrics".
+    A candidate is excluded whenever we don't have confirmed lyrics for it -
+    that includes both a confirmed "no lyrics" from Lyrica AND a check that
+    errored out (network/timeout/parse failure) after its retry budget is
+    spent. Unverified is not the same as verified, and this product's
+    requirement is strict about lyrics actually being available.
+
+    `degraded` is True when at least DEGRADED_ERROR_RATIO of the checked
+    candidates errored out - treated as "Lyrica itself is unreachable"
+    (systemic), not "these particular songs lack lyrics." Below that ratio,
+    errors are assumed to be per-candidate noise and are simply excluded
+    without a batch-level warning.
     """
     checked = candidates[:cap]
     if not checked:
@@ -79,12 +137,16 @@ def filter_candidates_by_lyrics(
         results = list(executor.map(lambda c: _check_one(c, identity_fn, timeout), checked))
 
     kept = []
+    error_count = 0
     for candidate, status, identity in results:
         if status == "no_lyrics":
+            continue
+        if status == "error":
+            error_count += 1
             continue
         if status == "has_lyrics" and identity:
             candidate = {**candidate, "_resolved_identity": identity}
         kept.append(candidate)
 
-    degraded = all(status == "error" for _, status, _ in results)
+    degraded = (error_count / len(checked)) >= DEGRADED_ERROR_RATIO
     return kept, degraded
