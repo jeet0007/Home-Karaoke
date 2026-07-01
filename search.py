@@ -149,6 +149,7 @@ class KaraokeSearch:
             "title": title,
             "url": url,
             "duration": self._format_duration(duration),
+            "duration_seconds": self._safe_int(duration),
             "thumbnail": self._best_thumbnail(entry),
             "uploader": uploader,
             "view_count": entry.get("view_count"),
@@ -161,6 +162,15 @@ class KaraokeSearch:
         if thumbnails:
             return thumbnails[-1].get("url")
         return entry.get("thumbnail")
+
+    @staticmethod
+    def _safe_int(seconds):
+        if seconds is None:
+            return None
+        try:
+            return int(seconds)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _format_duration(seconds):

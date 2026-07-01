@@ -17,6 +17,7 @@ from fallback_search import parse_title_identity_candidates
 from lyrics_filter import filter_candidates_by_lyrics
 from search import KaraokeSearch
 from song_search import SongSearch, SongSearchError
+from song_selection import pick_best_candidate
 
 LYRICS_CHECK_CAP = 15
 UNIFIED_SEARCH_DEFAULT_LIMIT = 12
@@ -256,6 +257,24 @@ def _apply_resolved_identity(video):
     return {**video, "artist": artist, "clean_title": title}
 
 
+def _video_to_song_result(video):
+    """Reshape a lyrics-confirmed fallback video candidate into the same
+    song-result shape the primary ytmusicapi path returns.
+
+    The frontend must never see or pick a video (video_id, url, score,
+    uploader, view_count are all dropped here on purpose) - even when a
+    result only exists because we had to fall back to raw video search, it
+    is presented to the user as a song, with its artist/title resolved by
+    the lyrics check (see _apply_resolved_identity)."""
+    return {
+        "artist": video.get("artist", ""),
+        "title": video.get("clean_title", ""),
+        "album": None,
+        "duration_seconds": video.get("duration_seconds"),
+        "cover_art": video.get("thumbnail") or "",
+    }
+
+
 @app.route("/unified-search")
 def unified_search():
     """Single search entry point behind the unified `/` page.
@@ -267,6 +286,11 @@ def unified_search():
     videos directly (search.py), lyrics-filtered the same way but with
     artist/title guessed from the video title (fallback_search.py) since
     those videos carry no structured metadata.
+
+    Either way, every result returned to the caller is a *song* - artist,
+    title, album, duration, cover art - never a video candidate. Picking a
+    karaoke video happens entirely server-side in /select-song once the user
+    picks one of these songs.
     """
     query = request.args.get("q", "").strip()
     if not query:
@@ -285,13 +309,14 @@ def unified_search():
     if song_results:
         kept, degraded = filter_candidates_by_lyrics(song_results, _song_identity, cap=LYRICS_CHECK_CAP)
         if kept:
-            response = {"query": query, "mode": "songs", "count": len(kept[:limit]), "results": kept[:limit]}
+            response = {"query": query, "source": "identity", "count": len(kept[:limit]), "results": kept[:limit]}
             if degraded:
                 response["warning"] = "Lyrics availability check is temporarily unavailable; results are unfiltered."
             return jsonify(response)
 
     # Nothing usable from the song-identity path - fall back to direct
-    # karaoke video search, same as the original /search route.
+    # karaoke video search, same as the original /search route, but still
+    # surface the result as a song (see _video_to_song_result).
     video_results, error = _run_karaoke_search(query, limit)
     if error:
         if song_error:
@@ -300,17 +325,20 @@ def unified_search():
 
     kept, degraded = filter_candidates_by_lyrics(video_results, _video_identity_candidates, cap=LYRICS_CHECK_CAP)
     kept = [_apply_resolved_identity(v) for v in kept][:limit]
+    song_shaped = [_video_to_song_result(v) for v in kept]
 
     if song_error:
-        warning = f"Song search unavailable ({song_error}); showing direct video search results instead."
+        warning = f"Song search unavailable ({song_error}); showing best-guess song matches instead."
     elif not song_results:
-        warning = "No song match found for this query; showing direct video search results instead."
+        warning = "No song match found for this query; showing best-guess song matches instead."
     else:
-        warning = "Found song matches, but none have lyrics available; showing direct video search results instead."
+        warning = "Found song matches, but none have lyrics available; showing best-guess song matches instead."
     if degraded:
         warning += " Lyrics availability check is also temporarily unavailable; these results are unfiltered."
 
-    return jsonify({"query": query, "mode": "videos", "count": len(kept), "results": kept, "warning": warning})
+    return jsonify(
+        {"query": query, "source": "fallback", "count": len(song_shaped), "results": song_shaped, "warning": warning}
+    )
 
 
 @app.route("/preview")
@@ -326,25 +354,71 @@ def preview():
     return jsonify({"embed_url": f"https://www.youtube.com/embed/{match.group(1)}"})
 
 
+@app.route("/select-song")
+def select_song():
+    """Given a song identity the user picked from /unified-search (artist,
+    title, and optionally a duration hint), resolve everything the player
+    page needs in one response: synced lyrics + cover art (Lyrica metadata),
+    and the single best-matching karaoke video - auto-picked server-side via
+    the existing karaoke video ranking (search.py) plus a duration-proximity
+    bonus/penalty (song_selection.py). The frontend never sees the runner-up
+    candidates, only the winner's video_id (or null if nothing was found).
+    """
+    artist = request.args.get("artist", "").strip()
+    title = request.args.get("title", "").strip()
+    duration_hint = request.args.get("duration", type=int)
+    if not artist or not title:
+        return jsonify({"error": "Missing required query parameters 'artist' and 'title'"}), 400
+
+    metadata = lyrica_client.get_metadata(artist, title) or {}
+    lyrics_result = lyrica_client.get_lyrics_full(artist, title, duration=duration_hint) or {}
+
+    # Lyrica's metadata is the authoritative source for the song's real
+    # duration (used to score candidate videos below); the caller-supplied
+    # duration is only a fallback when Lyrica has no metadata for this song.
+    target_duration = metadata.get("duration_s")
+    if target_duration is None:
+        target_duration = duration_hint
+
+    query = f"{title} {artist}"
+    candidates, error = _run_karaoke_search(query, LYRICS_CHECK_CAP)
+    if error:
+        return error
+
+    best = pick_best_candidate(candidates, target_duration)
+
+    response = {
+        "artist": artist,
+        "title": title,
+        "duration_seconds": target_duration,
+        "cover_art": metadata.get("cover_art", ""),
+        "lyrics": {
+            "synced": lyrics_result.get("synced", []),
+            "plain": lyrics_result.get("plain", ""),
+            "source": lyrics_result.get("source", ""),
+        },
+        "video_id": None,
+    }
+
+    if best is None:
+        response["message"] = "No backing track found for this song."
+        return jsonify(response)
+
+    response["video_id"] = best["video_id"]
+    return jsonify(response)
+
+
 @app.route("/player")
 def player():
-    video_id = request.args.get("video_id", "").strip()
     title = request.args.get("title", "").strip() or "Untitled"
     artist = request.args.get("artist", "").strip() or "Unknown artist"
-    url = request.args.get("url", "").strip()
-
-    if not video_id:
-        return "Missing required query parameter 'video_id'", 400
-
-    if not url.startswith(("http://", "https://")):
-        url = f"https://www.youtube.com/watch?v={video_id}"
+    duration = request.args.get("duration", "").strip()
 
     return render_template(
         "player.html",
-        video_id=video_id,
         title=title,
         artist=artist,
-        url=url,
+        duration=duration,
     )
 
 

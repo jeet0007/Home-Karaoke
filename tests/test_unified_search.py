@@ -14,6 +14,7 @@ CLEAN_SONG = {
     "album": "All The Little Lights",
     "duration_seconds": 253,
     "ytmusic_video_id": "6bGmUTAfh-A",
+    "cover_art": "https://example.com/song-cover.jpg",
 }
 
 VIDEO_RESULT = {
@@ -21,6 +22,7 @@ VIDEO_RESULT = {
     "title": "Let Her Go - Passenger (Karaoke Version)",
     "url": "https://www.youtube.com/watch?v=abc12345678",
     "duration": "4:13",
+    "duration_seconds": 253,
     "thumbnail": "https://example.com/thumb.jpg",
     "uploader": "KaraFun",
     "view_count": 1000,
@@ -41,7 +43,7 @@ class UnifiedSearchRouteTestCase(unittest.TestCase):
 
     @patch("app.filter_candidates_by_lyrics")
     @patch("app.song_search.search")
-    def test_returns_songs_mode_when_song_has_lyrics(self, mock_song_search, mock_filter):
+    def test_returns_identity_source_when_song_has_lyrics(self, mock_song_search, mock_filter):
         mock_song_search.return_value = [CLEAN_SONG]
         mock_filter.return_value = ([CLEAN_SONG], False)
 
@@ -49,20 +51,20 @@ class UnifiedSearchRouteTestCase(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 200)
         data = resp.get_json()
-        self.assertEqual(data["mode"], "songs")
+        self.assertEqual(data["source"], "identity")
         self.assertEqual(data["results"], [CLEAN_SONG])
         self.assertNotIn("warning", data)
 
     @patch("app.filter_candidates_by_lyrics")
     @patch("app.song_search.search")
-    def test_songs_mode_surfaces_degraded_warning(self, mock_song_search, mock_filter):
+    def test_identity_source_surfaces_degraded_warning(self, mock_song_search, mock_filter):
         mock_song_search.return_value = [CLEAN_SONG]
         mock_filter.return_value = ([CLEAN_SONG], True)
 
         resp = self.client.get("/unified-search?q=anything")
 
         data = resp.get_json()
-        self.assertEqual(data["mode"], "songs")
+        self.assertEqual(data["source"], "identity")
         self.assertIn("temporarily unavailable", data["warning"])
 
     # -- fallback trigger: no song match at all ----------------------------
@@ -81,7 +83,7 @@ class UnifiedSearchRouteTestCase(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 200)
         data = resp.get_json()
-        self.assertEqual(data["mode"], "videos")
+        self.assertEqual(data["source"], "fallback")
         self.assertEqual(len(data["results"]), 1)
         self.assertIn("No song match found", data["warning"])
         mock_karaoke_search.assert_called_once()
@@ -100,7 +102,7 @@ class UnifiedSearchRouteTestCase(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 200)
         data = resp.get_json()
-        self.assertEqual(data["mode"], "videos")
+        self.assertEqual(data["source"], "fallback")
         self.assertIn("Song search unavailable", data["warning"])
 
     # -- fallback trigger: songs found but none have lyrics ----------------
@@ -118,14 +120,14 @@ class UnifiedSearchRouteTestCase(unittest.TestCase):
         resp = self.client.get("/unified-search?q=anything")
 
         data = resp.get_json()
-        self.assertEqual(data["mode"], "videos")
+        self.assertEqual(data["source"], "fallback")
         self.assertIn("none have lyrics available", data["warning"])
 
-    # -- fallback video result carries a resolved artist/title ------------
+    # -- fallback results are reshaped into song results, never raw videos --
 
     @patch("app.karaoke_search.search")
     @patch("app.song_search.search")
-    def test_fallback_video_result_gets_resolved_identity(self, mock_song_search, mock_karaoke_search):
+    def test_fallback_result_is_song_shaped_not_a_video_candidate(self, mock_song_search, mock_karaoke_search):
         mock_song_search.return_value = []
         mock_karaoke_search.return_value = [dict(VIDEO_RESULT)]
 
@@ -134,10 +136,23 @@ class UnifiedSearchRouteTestCase(unittest.TestCase):
             resp = self.client.get("/unified-search?q=anything")
 
         data = resp.get_json()
-        self.assertEqual(data["mode"], "videos")
+        self.assertEqual(data["source"], "fallback")
         self.assertEqual(len(data["results"]), 1)
-        self.assertEqual(data["results"][0]["artist"], "Passenger")
-        self.assertEqual(data["results"][0]["clean_title"], "Let Her Go")
+
+        result = data["results"][0]
+        self.assertEqual(
+            result,
+            {
+                "artist": "Passenger",
+                "title": "Let Her Go",
+                "album": None,
+                "duration_seconds": 253,
+                "cover_art": "https://example.com/thumb.jpg",
+            },
+        )
+        # Never expose video-picking fields to the frontend.
+        for video_only_field in ("video_id", "url", "score", "uploader", "view_count"):
+            self.assertNotIn(video_only_field, result)
 
     # -- both paths fail ----------------------------------------------------
 

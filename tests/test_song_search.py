@@ -12,6 +12,10 @@ RAW_RESULT = {
     "album": {"name": "All The Little Lights"},
     "duration_seconds": 253,
     "artists": [{"name": "Passenger"}],
+    "thumbnails": [
+        {"url": "https://example.com/small.jpg"},
+        {"url": "https://example.com/large.jpg"},
+    ],
 }
 
 
@@ -44,10 +48,21 @@ class SongSearchTestCase(unittest.TestCase):
                     "album": "All The Little Lights",
                     "duration_seconds": 253,
                     "ytmusic_video_id": "6bGmUTAfh-A",
+                    "cover_art": "https://example.com/large.jpg",
                 }
             ],
         )
         self.assertEqual(client.calls[0]["filter"], "songs")
+
+    def test_search_handles_missing_thumbnails_gracefully(self):
+        entry = dict(RAW_RESULT)
+        del entry["thumbnails"]
+        client = FakeClient(results=[entry])
+        song_search = SongSearch(client_factory=lambda: client)
+
+        results = song_search.search("query")
+
+        self.assertEqual(results[0]["cover_art"], "")
 
     def test_search_joins_multiple_artists(self):
         entry = dict(RAW_RESULT, artists=[{"name": "Artist A"}, {"name": "Artist B"}])
