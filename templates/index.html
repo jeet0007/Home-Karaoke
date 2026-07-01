@@ -58,12 +58,16 @@
     background: #000;
   }
 
-  .search-bar {
+  .search-bar-wrapper {
     max-width: 640px;
     margin: 1.5rem auto 0;
+    padding: 0 1.5rem;
+    position: relative;
+  }
+
+  .search-bar {
     display: flex;
     gap: 0.5rem;
-    padding: 0 1.5rem;
   }
 
   #query {
@@ -93,6 +97,70 @@
   }
 
   #search-btn:hover { background: #ff2e53; }
+
+  .suggestions-dropdown {
+    display: none;
+    position: absolute;
+    top: calc(100% + 0.35rem);
+    left: 1.5rem;
+    right: 1.5rem;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    max-height: 320px;
+    overflow-y: auto;
+    z-index: 10;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  }
+
+  .suggestions-dropdown.open { display: block; }
+
+  .suggestion-item {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.6rem 0.9rem;
+    cursor: pointer;
+  }
+
+  .suggestion-item:hover,
+  .suggestion-item.active {
+    background: var(--panel-hover);
+  }
+
+  .suggestion-thumb {
+    width: 36px;
+    height: 36px;
+    object-fit: cover;
+    border-radius: 4px;
+    flex-shrink: 0;
+    background: #000;
+  }
+
+  .suggestion-text { min-width: 0; }
+
+  .suggestion-title {
+    font-size: 0.92rem;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .suggestion-meta {
+    font-size: 0.78rem;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .suggestion-status {
+    padding: 0.7rem 0.9rem;
+    color: var(--muted);
+    font-size: 0.85rem;
+    text-align: center;
+  }
 
   main {
     max-width: 900px;
@@ -188,9 +256,12 @@
   <p>Type a song name and pick one — we handle finding a karaoke backing track for it. Only results with lyrics available are shown.</p>
 </header>
 
-<div class="search-bar">
-  <input id="query" type="text" placeholder="e.g. Let Her Go Passenger" autofocus autocomplete="off">
-  <button id="search-btn">Search</button>
+<div class="search-bar-wrapper">
+  <div class="search-bar">
+    <input id="query" type="text" placeholder="e.g. Let Her Go Passenger" autofocus autocomplete="off">
+    <button id="search-btn">Search</button>
+  </div>
+  <div id="suggestions" class="suggestions-dropdown"></div>
 </div>
 
 <main>
@@ -205,6 +276,11 @@
   const statusEl = document.getElementById('status');
   const warningEl = document.getElementById('warning-banner');
   const resultsEl = document.getElementById('results');
+  const suggestionsEl = document.getElementById('suggestions');
+
+  const SUGGESTION_DEBOUNCE_MS = 275;
+  const SUGGESTION_MIN_QUERY_LENGTH = 2;
+  const SUGGESTION_LIMIT = 8;
 
   function setStatus(html, isError) {
     statusEl.innerHTML = html;
@@ -259,10 +335,124 @@
     window.location.href = `/player?${params.toString()}`;
   }
 
+  // -- Typeahead suggestions --------------------------------------------
+  //
+  // /song-suggestions is a thin, unfiltered wrapper around ytmusicapi search
+  // (no lyrics-availability check), so it's fast enough to call on every
+  // keystroke. Picking a suggestion jumps straight to /player (and from
+  // there /select-song) for that exact song, skipping the slow
+  // /unified-search lyrics-filter fan-out entirely. Enter/Search without
+  // picking a suggestion still falls back to the full /unified-search flow
+  // via runSearch(), unchanged.
+
+  let suggestionDebounceTimer = null;
+  let suggestionRequestId = 0; // bumped per request; only the latest id's response is rendered, so a slow stale reply can never clobber a newer one
+  let suggestionAbortController = null;
+  let currentSuggestions = [];
+  let activeSuggestionIndex = -1;
+  let suggestionsOpen = false;
+
+  function closeSuggestions() {
+    suggestionsOpen = false;
+    suggestionsEl.classList.remove('open');
+    suggestionsEl.innerHTML = '';
+    currentSuggestions = [];
+    activeSuggestionIndex = -1;
+  }
+
+  function renderSuggestionItem(song, index) {
+    const meta = [song.album, formatDuration(song.duration_seconds)].filter(Boolean).join(' · ');
+    const thumb = song.cover_art || '';
+    return `
+      <div class="suggestion-item${index === activeSuggestionIndex ? ' active' : ''}" data-index="${index}">
+        ${thumb ? `<img class="suggestion-thumb" src="${escapeHtml(thumb)}" loading="lazy" alt="">` : ''}
+        <div class="suggestion-text">
+          <div class="suggestion-title">${escapeHtml(song.title)} <span style="color: var(--muted);">&mdash; ${escapeHtml(song.artist)}</span></div>
+          ${meta ? `<div class="suggestion-meta">${escapeHtml(meta)}</div>` : ''}
+        </div>
+      </div>
+    `;
+  }
+
+  function showSuggestionStatus(message) {
+    suggestionsOpen = true;
+    suggestionsEl.classList.add('open');
+    suggestionsEl.innerHTML = `<div class="suggestion-status">${escapeHtml(message)}</div>`;
+  }
+
+  function showSuggestionList(songs) {
+    suggestionsOpen = true;
+    suggestionsEl.classList.add('open');
+    suggestionsEl.innerHTML = songs.map((song, i) => renderSuggestionItem(song, i)).join('');
+  }
+
+  async function fetchSuggestions(query) {
+    const requestId = ++suggestionRequestId;
+    if (suggestionAbortController) suggestionAbortController.abort();
+    suggestionAbortController = new AbortController();
+
+    showSuggestionStatus('Loading…');
+
+    try {
+      const res = await fetch(
+        `/song-suggestions?q=${encodeURIComponent(query)}&limit=${SUGGESTION_LIMIT}`,
+        { signal: suggestionAbortController.signal }
+      );
+      // A newer keystroke superseded this request while it was in flight -
+      // drop the response so it can't overwrite what's now on screen.
+      if (requestId !== suggestionRequestId) return;
+
+      const data = await res.json();
+      if (requestId !== suggestionRequestId) return;
+
+      if (!res.ok) {
+        showSuggestionStatus(data.error || 'Suggestion lookup failed.');
+        return;
+      }
+
+      currentSuggestions = data.results || [];
+      activeSuggestionIndex = -1;
+      if (currentSuggestions.length === 0) {
+        showSuggestionStatus('No matches yet — keep typing, or press Enter to search.');
+        return;
+      }
+      showSuggestionList(currentSuggestions);
+    } catch (err) {
+      if (err.name === 'AbortError' || requestId !== suggestionRequestId) return;
+      showSuggestionStatus('Network error fetching suggestions.');
+    }
+  }
+
+  function scheduleSuggestions(rawQuery) {
+    if (suggestionDebounceTimer) clearTimeout(suggestionDebounceTimer);
+
+    const query = rawQuery.trim();
+    if (query.length < SUGGESTION_MIN_QUERY_LENGTH) {
+      suggestionRequestId++; // invalidate any in-flight request too short to matter now
+      if (suggestionAbortController) suggestionAbortController.abort();
+      closeSuggestions();
+      return;
+    }
+
+    suggestionDebounceTimer = setTimeout(() => fetchSuggestions(query), SUGGESTION_DEBOUNCE_MS);
+  }
+
+  function selectSuggestion(song) {
+    closeSuggestions();
+    openPlayer(song.artist, song.title, song.duration_seconds);
+  }
+
+  function moveActiveSuggestion(delta) {
+    if (currentSuggestions.length === 0) return;
+    activeSuggestionIndex = Math.max(-1, Math.min(currentSuggestions.length - 1, activeSuggestionIndex + delta));
+    showSuggestionList(currentSuggestions);
+  }
+
   async function runSearch() {
     const query = queryInput.value.trim();
     if (!query) return;
 
+    closeSuggestions();
     resultsEl.innerHTML = '';
     setWarning('');
     setStatus('<div class="spinner"></div>', false);
@@ -303,8 +493,47 @@
   });
 
   searchBtn.addEventListener('click', runSearch);
+
+  queryInput.addEventListener('input', () => scheduleSuggestions(queryInput.value));
+
   queryInput.addEventListener('keydown', (e) => {
+    if (suggestionsOpen && currentSuggestions.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        moveActiveSuggestion(1);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        moveActiveSuggestion(-1);
+        return;
+      }
+      if (e.key === 'Enter' && activeSuggestionIndex >= 0) {
+        e.preventDefault();
+        selectSuggestion(currentSuggestions[activeSuggestionIndex]);
+        return;
+      }
+      if (e.key === 'Escape') {
+        closeSuggestions();
+        return;
+      }
+    }
     if (e.key === 'Enter') runSearch();
+  });
+
+  // mousedown (not click) fires before the input's implicit blur, so the
+  // dropdown is still in the DOM and hasn't been torn down by a blur handler
+  // when we read which suggestion was picked.
+  suggestionsEl.addEventListener('mousedown', (e) => {
+    const item = e.target.closest('.suggestion-item');
+    if (!item) return;
+    e.preventDefault();
+    const index = Number(item.dataset.index);
+    selectSuggestion(currentSuggestions[index]);
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.search-bar-wrapper')) closeSuggestions();
   });
 </script>
 
