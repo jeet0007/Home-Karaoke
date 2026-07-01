@@ -9,20 +9,43 @@ APP_HOST="${APP_HOST:-127.0.0.1}"
 APP_PORT="${APP_PORT:-5000}"
 
 LYRICA_PID=""
+
+# Sends SIGTERM to a whole process group (so any children the sidecar spawns
+# die too), waits briefly, then escalates to SIGKILL if it's still alive.
+kill_group() {
+    local pid="$1"
+    kill -0 "$pid" 2>/dev/null || return 0
+    kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    echo "Lyrica sidecar didn't exit after SIGTERM; sending SIGKILL..."
+    kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+}
+
+# Safe to call more than once: LYRICA_PID is cleared once the process is gone.
 cleanup() {
     if [ -n "$LYRICA_PID" ]; then
-        kill "$LYRICA_PID" 2>/dev/null || true
+        kill_group "$LYRICA_PID"
+        LYRICA_PID=""
     fi
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 if [ -d "$LYRICA_DIR" ]; then
     echo "Installing Lyrica sidecar dependencies..."
     pip install -r "$LYRICA_DIR/requirements.txt" -q
 
     echo "Starting Lyrica sidecar on port $LYRICA_PORT..."
-    (cd "$LYRICA_DIR" && PORT="$LYRICA_PORT" python run.py) &
+    # `set -m` gives the backgrounded job its own process group, and `exec`
+    # collapses the subshell into `python run.py` so $! is the real PID
+    # (not a subshell wrapper) and doubles as that group's PGID. Toggled
+    # back off immediately so it doesn't affect the app.py foreground job.
+    set -m
+    (cd "$LYRICA_DIR" && exec env PORT="$LYRICA_PORT" python run.py) &
     LYRICA_PID=$!
+    set +m
 
     echo "Waiting for Lyrica to be ready..."
     ready=false
