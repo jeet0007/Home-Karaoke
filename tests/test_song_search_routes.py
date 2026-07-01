@@ -94,20 +94,19 @@ class SongSearchRouteTestCase(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 502)
 
-    # -- /player passes clean artist/title through for lyrics lookup ---
+    # -- /player passes clean artist/title through for /select-song ---
 
-    def test_player_embeds_clean_song_identity_for_lyrics_fetch(self):
-        resp = self.client.get(
-            "/player?video_id=abc12345678&title=Let+Her+Go&artist=Passenger&url=https://www.youtube.com/watch?v=abc12345678"
-        )
+    def test_player_embeds_clean_song_identity_for_select_song_fetch(self):
+        resp = self.client.get("/player?title=Let+Her+Go&artist=Passenger&duration=253")
 
         self.assertEqual(resp.status_code, 200)
         html = resp.get_data(as_text=True)
-        # player.html's loadLyrics() fetches /lyrics using these exact template
-        # vars, so whatever clean identity /player is called with is what
-        # /lyrics ends up queried with.
+        # player.html's loadSong() fetches /select-song using these exact
+        # template vars, so whatever identity /player is called with is what
+        # /select-song ends up queried with.
         self.assertIn('const songTitle = "Let Her Go"', html)
         self.assertIn('const artist = "Passenger"', html)
+        self.assertIn('const durationHint = "253"', html)
 
     def test_songs_page_redirects_to_home(self):
         resp = self.client.get("/songs")

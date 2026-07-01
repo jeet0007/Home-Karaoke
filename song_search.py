@@ -24,6 +24,14 @@ def _clean_artist(entry):
     return _ARTIST_SEPARATOR.join(names) if names else "Unknown artist"
 
 
+def _cover_art(entry):
+    """Best-effort cover art straight from ytmusicapi's own search result -
+    no extra network round trip per candidate, unlike Lyrica's metadata
+    lookup, so this is safe to attach to every result in a search response."""
+    thumbnails = entry.get("thumbnails") or []
+    return thumbnails[-1].get("url", "") if thumbnails else ""
+
+
 def _clean_result(entry):
     return {
         "artist": _clean_artist(entry),
@@ -31,6 +39,7 @@ def _clean_result(entry):
         "album": (entry.get("album") or {}).get("name"),
         "duration_seconds": entry.get("duration_seconds"),
         "ytmusic_video_id": entry.get("videoId"),
+        "cover_art": _cover_art(entry),
     }
 
 

@@ -98,12 +98,19 @@
     aspect-ratio: 16 / 9;
   }
 
-  video {
+  /* The auto-picked karaoke video is only ever played for its audio (see
+     the <audio> element below) - this <img> is the entire visual surface,
+     since the user never sees or picks a video in this product. */
+  #cover-art {
     width: 100%;
     height: 100%;
     display: block;
     object-fit: contain;
     background: #000;
+  }
+
+  #cover-art[hidden] {
+    display: none;
   }
 
   .overlay {
@@ -139,11 +146,6 @@
     margin: 0;
     color: var(--muted);
     line-height: 1.45;
-  }
-
-  .overlay-copy a {
-    color: var(--accent);
-    text-decoration: underline;
   }
 
   .controls {
@@ -276,15 +278,18 @@
     <div aria-hidden="true"></div>
   </div>
 
-  <section class="player-shell" aria-label="Karaoke video player">
-    <!-- crossorigin is safe now that src is same-origin (/stream-proxy) - it no
-         longer triggers a CORS check against the un-CORS-headered googlevideo CDN. -->
-    <video id="video" crossorigin="anonymous" autoplay muted playsinline></video>
-    <div id="video-overlay" class="overlay">
+  <section class="player-shell" aria-label="Karaoke player">
+    <!-- The video is never shown - only its audio track streams in the
+         background (see the JS below for why an <audio> element, not a
+         hidden <video>, drives playback). This cover art is the whole
+         visual surface. -->
+    <img id="cover-art" alt="" hidden>
+    <audio id="audio" preload="auto" style="display: none;"></audio>
+    <div id="player-overlay" class="overlay">
       <div>
         <div class="spinner" aria-hidden="true"></div>
-        <p class="overlay-title">Loading karaoke video</p>
-        <p class="overlay-copy">Resolving the playable stream...</p>
+        <p class="overlay-title">Finding a karaoke backing track</p>
+        <p class="overlay-copy">Looking up lyrics and a matching video...</p>
       </div>
     </div>
   </section>
@@ -305,13 +310,13 @@
 </main>
 
 <script>
-  const videoId = {{ video_id|tojson }};
   const songTitle = {{ title|tojson }};
   const artist = {{ artist|tojson }};
-  const youtubeUrl = {{ url|tojson }};
+  const durationHint = {{ duration|tojson }};
 
-  const video = document.getElementById('video');
-  const overlay = document.getElementById('video-overlay');
+  const coverArt = document.getElementById('cover-art');
+  const audio = document.getElementById('audio');
+  const overlay = document.getElementById('player-overlay');
   const playPauseBtn = document.getElementById('play-pause');
   const restartBtn = document.getElementById('restart');
   const volumeDownBtn = document.getElementById('volume-down');
@@ -328,33 +333,35 @@
     overlay.innerHTML = `
       <div>
         <div class="spinner" aria-hidden="true"></div>
-        <p class="overlay-title">Loading karaoke video</p>
+        <p class="overlay-title">Finding a karaoke backing track</p>
         <p class="overlay-copy">${message}</p>
       </div>
     `;
   }
 
-  function setOverlayError(message) {
+  function setOverlayMessage(title, message) {
     overlay.hidden = false;
     overlay.innerHTML = '';
 
     const wrap = document.createElement('div');
-    const title = document.createElement('p');
+    const titleEl = document.createElement('p');
     const copy = document.createElement('p');
-    const link = document.createElement('a');
 
-    title.className = 'overlay-title';
-    title.textContent = 'Could not load this video here';
+    titleEl.className = 'overlay-title';
+    titleEl.textContent = title;
     copy.className = 'overlay-copy';
-    copy.textContent = `${message} `;
-    link.href = youtubeUrl;
-    link.target = '_blank';
-    link.rel = 'noopener';
-    link.textContent = 'Open it on YouTube.';
+    copy.textContent = message;
 
-    copy.appendChild(link);
-    wrap.append(title, copy);
+    wrap.append(titleEl, copy);
     overlay.appendChild(wrap);
+  }
+
+  function setOverlayError(message) {
+    setOverlayMessage('Could not load this song', message);
+  }
+
+  function setOverlayNoBackingTrack(message) {
+    setOverlayMessage('No backing track found', message);
   }
 
   function enableControls() {
@@ -364,34 +371,34 @@
   }
 
   function setPlayButton() {
-    playPauseBtn.textContent = video.paused ? 'Play' : 'Pause';
+    playPauseBtn.textContent = audio.paused ? 'Play' : 'Pause';
   }
 
   async function togglePlayback() {
-    if (!video.src) return;
+    if (!audio.src) return;
 
-    video.muted = false;
-    if (video.paused) {
+    audio.muted = false;
+    if (audio.paused) {
       try {
-        await video.play();
+        await audio.play();
       } catch (err) {
         setOverlayError('The browser blocked playback until you interact with the page.');
       }
     } else {
-      video.pause();
+      audio.pause();
     }
     setPlayButton();
   }
 
-  async function restartVideo() {
-    if (!video.src) return;
+  async function restartPlayback() {
+    if (!audio.src) return;
 
-    video.muted = false;
-    video.currentTime = 0;
+    audio.muted = false;
+    audio.currentTime = 0;
     currentLyricIndex = -1;
     updateCurrentLyric(0);
     try {
-      await video.play();
+      await audio.play();
     } catch (err) {
       setOverlayError('The browser blocked playback until you interact with the page.');
     }
@@ -399,50 +406,34 @@
   }
 
   function changeVolume(delta) {
-    video.muted = false;
-    video.volume = Math.max(0, Math.min(1, video.volume + delta));
+    audio.muted = false;
+    audio.volume = Math.max(0, Math.min(1, audio.volume + delta));
   }
 
   function showLyricsFallback() {
-    lyricsPanel.innerHTML = '<div class="lyrics-empty">No lyrics found &mdash; enjoy the video!</div>';
+    lyricsPanel.innerHTML = '<div class="lyrics-empty">No lyrics found &mdash; enjoy the music!</div>';
   }
 
-  async function loadLyrics() {
-    try {
-      const params = new URLSearchParams({ artist, title: songTitle });
-      const res = await fetch(`/lyrics?${params.toString()}`);
-      if (!res.ok) {
-        showLyricsFallback();
-        return;
-      }
+  function renderLyrics(syncedLines) {
+    const cleaned = (syncedLines || [])
+      .filter((line) => Number.isFinite(Number(line.time_ms)) && line.text)
+      .map((line) => ({ time_ms: Number(line.time_ms), text: String(line.text) }))
+      .sort((a, b) => a.time_ms - b.time_ms);
 
-      const data = await res.json();
-      if (!Array.isArray(data.synced) || data.synced.length === 0) {
-        showLyricsFallback();
-        return;
-      }
-
-      lyrics = data.synced
-        .filter((line) => Number.isFinite(Number(line.time_ms)) && line.text)
-        .map((line) => ({ time_ms: Number(line.time_ms), text: String(line.text) }))
-        .sort((a, b) => a.time_ms - b.time_ms);
-
-      if (lyrics.length === 0) {
-        showLyricsFallback();
-        return;
-      }
-
-      lyricsPanel.innerHTML = '';
-      lyricNodes = lyrics.map((line) => {
-        const node = document.createElement('div');
-        node.className = 'lyric-line upcoming';
-        node.textContent = line.text;
-        lyricsPanel.appendChild(node);
-        return node;
-      });
-    } catch (err) {
+    if (cleaned.length === 0) {
       showLyricsFallback();
+      return;
     }
+
+    lyrics = cleaned;
+    lyricsPanel.innerHTML = '';
+    lyricNodes = lyrics.map((line) => {
+      const node = document.createElement('div');
+      node.className = 'lyric-line upcoming';
+      node.textContent = line.text;
+      lyricsPanel.appendChild(node);
+      return node;
+    });
   }
 
   function findCurrentLyricIndex(nowMs) {
@@ -482,11 +473,11 @@
   }
 
   function syncLyrics() {
-    updateCurrentLyric(video.currentTime * 1000);
+    updateCurrentLyric(audio.currentTime * 1000);
     animationFrameId = requestAnimationFrame(syncLyrics);
   }
 
-  async function loadStream() {
+  async function loadStream(videoId) {
     setOverlayLoading('Resolving the playable stream...');
 
     try {
@@ -500,8 +491,8 @@
         console.warn(data.warning);
       }
 
-      video.src = data.stream_url;
-      video.load();
+      audio.src = data.stream_url;
+      audio.load();
       overlay.hidden = true;
       enableControls();
     } catch (err) {
@@ -509,15 +500,50 @@
     }
   }
 
+  async function loadSong() {
+    setOverlayLoading('Looking up lyrics and a matching video...');
+
+    try {
+      const params = new URLSearchParams({ artist, title: songTitle });
+      if (durationHint) params.set('duration', durationHint);
+
+      const res = await fetch(`/select-song?${params.toString()}`);
+      const data = await res.json();
+
+      if (!res.ok) {
+        setOverlayError(data.error || 'Could not load this song.');
+        showLyricsFallback();
+        return;
+      }
+
+      if (data.cover_art) {
+        coverArt.src = data.cover_art;
+        coverArt.hidden = false;
+      }
+
+      renderLyrics(data.lyrics && data.lyrics.synced);
+
+      if (!data.video_id) {
+        setOverlayNoBackingTrack(data.message || 'No backing track found for this song.');
+        return;
+      }
+
+      await loadStream(data.video_id);
+    } catch (err) {
+      setOverlayError('Network error — is the server running?');
+      showLyricsFallback();
+    }
+  }
+
   playPauseBtn.addEventListener('click', togglePlayback);
-  restartBtn.addEventListener('click', restartVideo);
+  restartBtn.addEventListener('click', restartPlayback);
   volumeDownBtn.addEventListener('click', () => changeVolume(-0.1));
   volumeUpBtn.addEventListener('click', () => changeVolume(0.1));
 
-  video.addEventListener('play', setPlayButton);
-  video.addEventListener('pause', setPlayButton);
-  video.addEventListener('ended', setPlayButton);
-  video.addEventListener('error', () => {
+  audio.addEventListener('play', setPlayButton);
+  audio.addEventListener('pause', setPlayButton);
+  audio.addEventListener('ended', setPlayButton);
+  audio.addEventListener('error', () => {
     setOverlayError('The resolved stream was rejected by the browser or expired.');
   });
 
@@ -529,7 +555,7 @@
       e.preventDefault();
       togglePlayback();
     } else if (e.key.toLowerCase() === 'r') {
-      restartVideo();
+      restartPlayback();
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
       changeVolume(0.1);
@@ -541,8 +567,9 @@
 
   // TODO: wire to /grade WebSocket when audio grading is built
 
-  loadStream();
-  loadLyrics();
+  audio.autoplay = true;
+  audio.muted = true;
+  loadSong();
   animationFrameId = requestAnimationFrame(syncLyrics);
   window.addEventListener('beforeunload', () => cancelAnimationFrame(animationFrameId));
 </script>
