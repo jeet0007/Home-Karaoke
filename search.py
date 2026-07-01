@@ -145,6 +145,7 @@ class KaraokeSearch:
         duration = entry.get("duration")
 
         return {
+            "video_id": video_id,
             "title": title,
             "url": url,
             "duration": self._format_duration(duration),
