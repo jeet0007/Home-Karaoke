@@ -18,6 +18,7 @@ from flask_sock import Sock
 from simple_websocket import ConnectionClosed
 
 import lyrica_client
+import waveform
 from audio_grading import RealtimeGrader
 from fallback_search import parse_title_identity_candidates
 from lyrics_filter import filter_candidates_by_lyrics
@@ -57,6 +58,15 @@ _STREAM_CACHE_LOCK = threading.Lock()
 _STREAM_EXPIRY_BUFFER_S = 60
 _PROXY_CHUNK_SIZE = 256 * 1024
 _PASSTHROUGH_RESPONSE_HEADERS = ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges")
+
+# Waveform peaks are cheap (a few hundred floats) and, unlike the resolved
+# CDN URL in _STREAM_CACHE, never expire - so this is a plain in-memory
+# video_id -> {"peaks": [...], "duration_s": float} cache with no TTL. It
+# does not survive a restart; that's an acceptable tradeoff for this
+# visualization-only feature (see waveform.py).
+_WAVEFORM_CACHE = {}
+_WAVEFORM_CACHE_LOCK = threading.Lock()
+_WAVEFORM_RESOLVE_TIMEOUT_S = 20
 
 _http_client = httpx.Client(follow_redirects=True, timeout=20.0)
 
@@ -172,6 +182,34 @@ def _get_upstream_stream_url(video_id, timeout=20, force_refresh=False):
             "warning": warning,
         }
     return stream_url, warning
+
+
+def _compute_waveform(video_id, timeout=_WAVEFORM_RESOLVE_TIMEOUT_S):
+    """Resolve an audio-only stream URL for video_id (deliberately not the
+    progressive video+audio URL /stream-proxy plays - see waveform.py) and
+    decode it into a peaks envelope."""
+    youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+    audio_urls = _resolve_stream_urls(youtube_url, "bestaudio/best", timeout)
+    if not audio_urls:
+        raise RuntimeError("yt-dlp did not return an audio stream URL")
+
+    pcm = waveform.decode_pcm_from_url(audio_urls[0])
+    return {
+        "peaks": waveform.compute_peaks(pcm),
+        "duration_s": waveform.pcm_duration_s(pcm),
+    }
+
+
+def _get_or_compute_waveform(video_id, timeout=_WAVEFORM_RESOLVE_TIMEOUT_S):
+    with _WAVEFORM_CACHE_LOCK:
+        cached = _WAVEFORM_CACHE.get(video_id)
+    if cached is not None:
+        return cached
+
+    result = _compute_waveform(video_id, timeout=timeout)
+    with _WAVEFORM_CACHE_LOCK:
+        _WAVEFORM_CACHE[video_id] = result
+    return result
 
 
 @app.route("/")
@@ -426,6 +464,22 @@ def _prewarm_stream_cache(video_id):
         pass
 
 
+def _prewarm_waveform(video_id):
+    """Best-effort background compute of _WAVEFORM_CACHE for the video
+    /select-song just picked, so the frontend's likely follow-up /waveform
+    call often finds a warm cache instead of paying decode cost inline.
+    Fire-and-forget, same pattern as _prewarm_stream_cache: on any failure
+    (including a missing ffmpeg binary) the frontend's own /waveform request
+    will surface the error, or the waveform simply never appears - either
+    way playback and lyrics are unaffected."""
+    if not waveform.ffmpeg_available():
+        return
+    try:
+        _get_or_compute_waveform(video_id)
+    except Exception:
+        pass
+
+
 @app.route("/select-song")
 def select_song():
     """Given a song identity the user picked from /unified-search (artist,
@@ -494,6 +548,7 @@ def select_song():
 
     response["video_id"] = best["video_id"]
     threading.Thread(target=_prewarm_stream_cache, args=(best["video_id"],), daemon=True).start()
+    threading.Thread(target=_prewarm_waveform, args=(best["video_id"],), daemon=True).start()
     return jsonify(response)
 
 
@@ -590,6 +645,35 @@ def stream_proxy(video_id):
     headers["Cache-Control"] = "no-store"
 
     return Response(stream_with_context(generate()), status=upstream.status_code, headers=headers)
+
+
+@app.route("/waveform/<video_id>")
+def waveform_route(video_id):
+    """Coarse peak envelope for the player's waveform visualization - see
+    waveform.py for why this decodes its own audio-only stream rather than
+    reusing /stream-proxy's progressive video+audio one. Purely additive: on
+    any failure here the frontend just doesn't draw a waveform, playback and
+    lyrics are unaffected."""
+    video_id = video_id.strip()
+    if not VIDEO_ID_ONLY_PATTERN.match(video_id):
+        return jsonify({"error": "Invalid YouTube video id"}), 400
+
+    if not os.path.isfile(BINARY_PATH):
+        return jsonify({"error": f"yt-dlp binary not found at {BINARY_PATH}"}), 500
+
+    if not waveform.ffmpeg_available():
+        return jsonify({"error": "ffmpeg is not installed on this server"}), 503
+
+    try:
+        result = _get_or_compute_waveform(video_id)
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Timed out while generating the waveform"}), 504
+    except OSError as exc:
+        return jsonify({"error": f"failed to execute yt-dlp: {exc}"}), 500
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 502
+
+    return jsonify(result)
 
 
 @sock.route("/grade")

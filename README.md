@@ -64,6 +64,14 @@ GET /metadata?artist=<str>&title=<str>
 `genre` is derived from Lyrica's `tags` list (comma-joined); other fields Lyrica returns (album,
 popularity, links, etc.) are passed through as-is.
 
+## Waveform
+
+The player shows a coarse waveform visualization of the current song, computed server-side and served
+from `GET /waveform/<video_id>` (a bucketed peak envelope + duration, cached in memory per video). This
+requires `ffmpeg` on the server's `PATH` — it's not vendored, install it separately (e.g. `brew install
+ffmpeg` / `apt install ffmpeg`). If `ffmpeg` isn't found, `/waveform` returns a 503 and the player simply
+shows no waveform; playback and lyrics are unaffected.
+
 ## Notes
 
 - Search is powered by the bundled `binaries/yt-dlp` binary (already included in this repo) — no separate yt-dlp install is required for search itself, though `yt-dlp` is still listed in `requirements.txt` as a Python fallback/dependency.
