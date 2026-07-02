@@ -27,6 +27,50 @@
     min-height: 100vh;
   }
 
+  /* 3-layer player background: (1) the song's YouTube thumbnail, full-bleed
+     and blurred on itself - not via backdrop-filter on the content above it,
+     which avoids cross-browser cost/inconsistency and the blurred-edge halo
+     backdrop-filter produces - (2) a dark scrim gradient over the blur so
+     lyrics/waveform stay legible regardless of the art's colors, and
+     (3) the existing lyrics + waveform panels, restacked above both via this
+     container's negative z-index. Fixed + inset:0 so it fills the viewport
+     behind the normal-flow page content without needing z-index on anything
+     else. */
+  .art-background {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    overflow: hidden;
+    background: var(--bg);
+  }
+
+  .art-background-img {
+    position: absolute;
+    top: -6%;
+    left: -6%;
+    width: 112%;
+    height: 112%;
+    object-fit: cover;
+    filter: blur(28px);
+    opacity: 0;
+    transition: opacity 0.5s ease;
+  }
+
+  .art-background-img.is-loaded {
+    opacity: 1;
+  }
+
+  .art-background-scrim {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+      to bottom,
+      rgba(8, 9, 13, 0.55) 0%,
+      rgba(8, 9, 13, 0.62) 45%,
+      rgba(8, 9, 13, 0.92) 100%
+    );
+  }
+
   a {
     color: inherit;
     text-decoration: none;
@@ -152,7 +196,7 @@
     margin-top: 0.85rem;
     border: 1px solid var(--border);
     border-radius: 10px;
-    background: var(--panel);
+    background: rgba(12, 13, 18, 0.55);
     overflow: hidden;
   }
 
@@ -207,7 +251,7 @@
     padding: 2rem 1rem;
     border: 1px solid var(--border);
     border-radius: 10px;
-    background: var(--panel);
+    background: rgba(12, 13, 18, 0.5);
     scroll-behavior: smooth;
   }
 
@@ -285,6 +329,11 @@
 </head>
 <body>
 
+<div class="art-background" aria-hidden="true">
+  <img id="art-background-img" class="art-background-img" alt="">
+  <div class="art-background-scrim"></div>
+</div>
+
 <main class="page">
   <div class="topbar">
     <a class="back-link" href="/">Back to search</a>
@@ -329,12 +378,14 @@
   </section>
 </main>
 
+<script src="/static/thumbnail-fallback.js"></script>
 <script>
   const songTitle = {{ title|tojson }};
   const artist = {{ artist|tojson }};
   const durationHint = {{ duration|tojson }};
 
   const coverArt = document.getElementById('cover-art');
+  const artBackgroundImg = document.getElementById('art-background-img');
   const audio = document.getElementById('audio');
   const overlay = document.getElementById('player-overlay');
   const playPauseBtn = document.getElementById('play-pause');
@@ -387,6 +438,19 @@
 
   function setOverlayNoBackingTrack(message) {
     setOverlayMessage('No backing track found', message);
+  }
+
+  // Layer 1 of the player background: the song's own YouTube thumbnail,
+  // blurred full-bleed behind the lyrics/waveform (see the .art-background
+  // rules above). ThumbnailFallback (static/thumbnail-fallback.js) walks
+  // maxresdefault -> sddefault -> hqdefault -> mqdefault since maxresdefault
+  // doesn't exist for every upload. Best-effort: if every quality misses,
+  // the background just stays the plain --bg fill it already has.
+  function setArtBackground(videoId) {
+    if (!videoId || typeof ThumbnailFallback === 'undefined') return;
+    ThumbnailFallback.attachThumbnailFallback(artBackgroundImg, videoId, () => {
+      artBackgroundImg.classList.add('is-loaded');
+    });
   }
 
   function enableControls() {
@@ -567,7 +631,12 @@
     for (let i = 0; i < barCount; i++) {
       const amplitude = Math.max(0.03, Math.min(1, waveformPeaks[i]));
       const barHeight = amplitude * height;
-      waveformCtx.fillStyle = i <= progressIndex ? '#ff4d6d' : '#3a3f4c';
+      // Unplayed bars used to be a dark blue-grey (#3a3f4c), which read fine
+      // against the old flat panel background but disappears into blurred
+      // album art of arbitrary color. Semi-transparent white holds contrast
+      // against any art hue while still reading as "unplayed" next to the
+      // solid accent-colored played bars.
+      waveformCtx.fillStyle = i <= progressIndex ? '#ff4d6d' : 'rgba(255, 255, 255, 0.45)';
       waveformCtx.fillRect(i * barWidth, midY - barHeight / 2, Math.max(1, barWidth - 1), barHeight);
     }
   }
@@ -651,6 +720,7 @@
         return;
       }
 
+      setArtBackground(data.video_id);
       await loadStream(data.video_id);
       loadWaveform(data.video_id);
     } catch (err) {
