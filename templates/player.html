@@ -148,6 +148,22 @@
     line-height: 1.45;
   }
 
+  .waveform-panel {
+    margin-top: 0.85rem;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+    overflow: hidden;
+  }
+
+  .waveform-panel[hidden] { display: none; }
+
+  #waveform-canvas {
+    display: block;
+    width: 100%;
+    height: 64px;
+  }
+
   .controls {
     display: flex;
     align-items: center;
@@ -294,6 +310,10 @@
     </div>
   </section>
 
+  <section id="waveform-panel" class="waveform-panel" aria-hidden="true" hidden>
+    <canvas id="waveform-canvas"></canvas>
+  </section>
+
   <section class="controls" aria-label="Playback controls">
     <button id="play-pause" type="button" disabled>Play</button>
     <button id="restart" type="button" disabled>Restart</button>
@@ -322,11 +342,16 @@
   const volumeDownBtn = document.getElementById('volume-down');
   const volumeUpBtn = document.getElementById('volume-up');
   const lyricsPanel = document.getElementById('lyrics-panel');
+  const waveformPanel = document.getElementById('waveform-panel');
+  const waveformCanvas = document.getElementById('waveform-canvas');
+  const waveformCtx = waveformCanvas.getContext('2d');
 
   let lyrics = [];
   let lyricNodes = [];
   let currentLyricIndex = -1;
   let animationFrameId = null;
+  let waveformPeaks = null;
+  let waveformDurationS = 0;
 
   function setOverlayLoading(message) {
     overlay.hidden = false;
@@ -501,7 +526,74 @@
 
   function syncLyrics() {
     updateCurrentLyric(audio.currentTime * 1000);
+    updateWaveformPlayhead();
     animationFrameId = requestAnimationFrame(syncLyrics);
+  }
+
+  // -- Waveform visualization (optional) -----------------------------
+  //
+  // Entirely additive, same spirit as live grading below: /waveform can 404,
+  // time out, or the server can simply not have ffmpeg installed, and the
+  // panel just never appears - playback and lyrics are unaffected either
+  // way. See waveform.py / app.py's /waveform route for how peaks are
+  // computed server-side (a bucketed max-amplitude envelope of the song's
+  // audio-only stream, not the progressive video+audio one /stream-proxy
+  // plays).
+  function resizeWaveformCanvasIfNeeded() {
+    const rect = waveformCanvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const width = Math.max(1, Math.round(rect.width * dpr));
+    const height = Math.max(1, Math.round(rect.height * dpr));
+    if (waveformCanvas.width !== width || waveformCanvas.height !== height) {
+      waveformCanvas.width = width;
+      waveformCanvas.height = height;
+    }
+  }
+
+  function drawWaveform(progressFraction) {
+    if (!waveformPeaks || waveformPeaks.length === 0) return;
+
+    resizeWaveformCanvasIfNeeded();
+
+    const width = waveformCanvas.width;
+    const height = waveformCanvas.height;
+    waveformCtx.clearRect(0, 0, width, height);
+
+    const barCount = waveformPeaks.length;
+    const barWidth = width / barCount;
+    const midY = height / 2;
+    const progressIndex = Math.floor(progressFraction * barCount);
+
+    for (let i = 0; i < barCount; i++) {
+      const amplitude = Math.max(0.03, Math.min(1, waveformPeaks[i]));
+      const barHeight = amplitude * height;
+      waveformCtx.fillStyle = i <= progressIndex ? '#ff4d6d' : '#3a3f4c';
+      waveformCtx.fillRect(i * barWidth, midY - barHeight / 2, Math.max(1, barWidth - 1), barHeight);
+    }
+  }
+
+  function updateWaveformPlayhead() {
+    if (!waveformPeaks || !waveformDurationS) return;
+    const progress = Math.max(0, Math.min(1, audio.currentTime / waveformDurationS));
+    drawWaveform(progress);
+  }
+
+  async function loadWaveform(videoId) {
+    try {
+      const res = await fetch(`/waveform/${encodeURIComponent(videoId)}`);
+      if (!res.ok) return;
+
+      const data = await res.json();
+      if (!Array.isArray(data.peaks) || data.peaks.length === 0) return;
+
+      waveformPeaks = data.peaks;
+      waveformDurationS = Number(data.duration_s) || Number(durationHint) || 0;
+      waveformPanel.hidden = false;
+      waveformPanel.setAttribute('aria-hidden', 'false');
+      drawWaveform(0);
+    } catch (err) {
+      // Best-effort - the player works fine with no waveform.
+    }
   }
 
   async function loadStream(videoId) {
@@ -560,6 +652,7 @@
       }
 
       await loadStream(data.video_id);
+      loadWaveform(data.video_id);
     } catch (err) {
       setOverlayError('Network error — is the server running?');
       showLyricsFallback();

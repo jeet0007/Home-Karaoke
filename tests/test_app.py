@@ -169,5 +169,92 @@ class StreamProxyTestCase(unittest.TestCase):
         self.assertEqual(mock_resolve.call_count, 2)
 
 
+class WaveformRouteTestCase(unittest.TestCase):
+    def setUp(self):
+        app_module.app.testing = True
+        self.client = app_module.app.test_client()
+        app_module._WAVEFORM_CACHE.clear()
+        self.binary_patch = patch("app.os.path.isfile", return_value=True)
+        self.binary_patch.start()
+        self.addCleanup(self.binary_patch.stop)
+        self.addCleanup(app_module._WAVEFORM_CACHE.clear)
+
+    def test_invalid_video_id_is_rejected(self):
+        resp = self.client.get("/waveform/not-valid")
+        self.assertEqual(resp.status_code, 400)
+
+    @patch("app.waveform.ffmpeg_available", return_value=False)
+    def test_missing_ffmpeg_returns_503(self, _mock_available):
+        resp = self.client.get(f"/waveform/{VIDEO_ID}")
+
+        self.assertEqual(resp.status_code, 503)
+        self.assertIn("ffmpeg", resp.get_json()["error"])
+
+    @patch("app.waveform.compute_peaks", return_value=[0.1, 0.9, 0.4])
+    @patch("app.waveform.pcm_duration_s", return_value=12.5)
+    @patch("app.waveform.decode_pcm_from_url", return_value=b"\x00\x01")
+    @patch("app._resolve_stream_urls")
+    @patch("app.waveform.ffmpeg_available", return_value=True)
+    def test_returns_peaks_and_duration_on_success(
+        self, _mock_available, mock_resolve, mock_decode, _mock_duration, _mock_peaks
+    ):
+        mock_resolve.return_value = ["https://example.com/bestaudio"]
+
+        resp = self.client.get(f"/waveform/{VIDEO_ID}")
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["peaks"], [0.1, 0.9, 0.4])
+        self.assertEqual(data["duration_s"], 12.5)
+        mock_resolve.assert_called_once_with(f"https://www.youtube.com/watch?v={VIDEO_ID}", "bestaudio/best", 20)
+        mock_decode.assert_called_once_with("https://example.com/bestaudio")
+
+    @patch("app.waveform.compute_peaks", return_value=[0.5])
+    @patch("app.waveform.pcm_duration_s", return_value=1.0)
+    @patch("app.waveform.decode_pcm_from_url", return_value=b"\x00")
+    @patch("app._resolve_stream_urls")
+    @patch("app.waveform.ffmpeg_available", return_value=True)
+    def test_result_is_cached_between_calls(
+        self, _mock_available, mock_resolve, mock_decode, _mock_duration, _mock_peaks
+    ):
+        mock_resolve.return_value = ["https://example.com/bestaudio"]
+
+        resp1 = self.client.get(f"/waveform/{VIDEO_ID}")
+        resp2 = self.client.get(f"/waveform/{VIDEO_ID}")
+
+        self.assertEqual(resp1.get_json(), resp2.get_json())
+        mock_resolve.assert_called_once()
+        mock_decode.assert_called_once()
+
+    @patch("app._resolve_stream_urls")
+    @patch("app.waveform.ffmpeg_available", return_value=True)
+    def test_ytdlp_failure_surfaces_as_502(self, _mock_available, mock_resolve):
+        mock_resolve.side_effect = RuntimeError("yt-dlp failed: video unavailable")
+
+        resp = self.client.get(f"/waveform/{VIDEO_ID}")
+
+        self.assertEqual(resp.status_code, 502)
+        self.assertIn("video unavailable", resp.get_json()["error"])
+
+    @patch("app._resolve_stream_urls", return_value=[])
+    @patch("app.waveform.ffmpeg_available", return_value=True)
+    def test_no_audio_url_resolved_surfaces_as_502(self, _mock_available, _mock_resolve):
+        resp = self.client.get(f"/waveform/{VIDEO_ID}")
+
+        self.assertEqual(resp.status_code, 502)
+
+    @patch("app.waveform.decode_pcm_from_url")
+    @patch("app._resolve_stream_urls")
+    @patch("app.waveform.ffmpeg_available", return_value=True)
+    def test_ffmpeg_decode_failure_surfaces_as_502(self, _mock_available, mock_resolve, mock_decode):
+        mock_resolve.return_value = ["https://example.com/bestaudio"]
+        mock_decode.side_effect = RuntimeError("ffmpeg failed: Invalid data found when processing input")
+
+        resp = self.client.get(f"/waveform/{VIDEO_ID}")
+
+        self.assertEqual(resp.status_code, 502)
+        self.assertIn("Invalid data found", resp.get_json()["error"])
+
+
 if __name__ == "__main__":
     unittest.main()
