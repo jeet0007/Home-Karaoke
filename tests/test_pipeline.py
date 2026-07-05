@@ -1,0 +1,302 @@
+import contextlib
+import os
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core import artifacts  # noqa: E402
+from core import library  # noqa: E402
+from core import pipeline  # noqa: E402
+
+LYRICS = {"synced": [{"time_ms": 0, "text": "hi"}], "plain": "hi", "source": "lrclib"}
+VIDEO = {"video_id": "vid123", "duration_seconds": 200}
+# Basic Pitch note events: (start_s, end_s, pitch_midi, amplitude, pitch_bends).
+NOTE_EVENTS = [(0.0, 0.5, 60, 0.9, []), (0.6, 1.0, 62, 0.9, [])]
+
+
+def _song(**overrides):
+    song = {"id": 1, "artist": "Passenger", "title": "Let Her Go", "duration_seconds": 200, "ytmusic_video_id": "ytm1"}
+    song.update(overrides)
+    return song
+
+
+@contextlib.contextmanager
+def _vocal_stubs(decode=None, separate=None, transcribe_return=NOTE_EVENTS, available=True):
+    """Patch the ML vocal stages so the pipeline's vocal path runs without
+    torch/ffmpeg. note_events_to_segments stays REAL (pure conversion)."""
+
+    def default_decode(url, out_path, timeout=120):
+        with open(out_path, "wb") as handle:
+            handle.write(b"MIX")
+        return out_path
+
+    def default_separate(mix_path, vocal_path):
+        with open(vocal_path, "wb") as handle:
+            handle.write(b"VOX")
+        return vocal_path
+
+    with mock.patch.object(pipeline.vocal_transcribe, "available", return_value=available), mock.patch.object(
+        pipeline.vocal_transcribe, "_decode_to_wav", side_effect=decode or default_decode
+    ), mock.patch.object(
+        pipeline.vocal_transcribe, "separate_vocals", side_effect=separate or default_separate
+    ), mock.patch.object(
+        pipeline.vocal_transcribe, "transcribe", return_value=transcribe_return
+    ):
+        yield
+
+
+class PipelineTestCase(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = artifacts.ArtifactStore(tmp.name)
+
+    def _build(self, **overrides):
+        steps = {
+            "fetch_lyrics": lambda a, t, d: LYRICS,
+            "find_video": lambda a, t, d: VIDEO,
+            "resolve_audio_url": lambda ytm: f"https://audio/{ytm}",
+        }
+        steps.update(overrides)
+        return pipeline.build_processor(self.store, **steps)
+
+    def test_missing_synced_lyrics_fails(self):
+        process = self._build(fetch_lyrics=lambda a, t, d: {"synced": [], "plain": "x"})
+        with self.assertRaises(library.ProcessingError):
+            process(_song())
+
+    def test_missing_video_fails(self):
+        process = self._build(find_video=lambda a, t, d: None)
+        with self.assertRaises(library.ProcessingError):
+            process(_song())
+
+    def test_vocal_path_writes_and_records_artifacts(self):
+        with _vocal_stubs():
+            result = self._build()(_song())
+
+        self.assertEqual(result["video_id"], "vid123")
+        self.assertEqual(result["melody"]["source"], "demucs+basic-pitch")
+        self.assertEqual([n["midi"] for n in result["melody"]["notes"]], [60, 62])
+        kinds = {a["kind"] for a in result["artifacts"]}
+        self.assertEqual(kinds, {"lyrics", "mix", "vocals", "melody", "midi"})
+        self.assertTrue(self.store.exists(1, artifacts.KIND_MIDI))
+        with open(self.store.path(1, artifacts.KIND_MIDI), "rb") as handle:
+            self.assertEqual(handle.read(4), b"MThd")
+
+    def test_vocal_path_keeps_stem(self):
+        decode_calls, separate_calls = [], []
+
+        def fake_decode(url, out_path, timeout=120):
+            decode_calls.append(url)
+            with open(out_path, "wb") as handle:
+                handle.write(b"MIX")
+            return out_path
+
+        def fake_separate(mix_path, vocal_path):
+            separate_calls.append(mix_path)
+            with open(vocal_path, "wb") as handle:
+                handle.write(b"VOX")
+            return vocal_path
+
+        with _vocal_stubs(decode=fake_decode, separate=fake_separate):
+            self._build()(_song())
+
+        # The mix + vocal stem are persisted (the user's "singer audio").
+        self.assertTrue(self.store.exists(1, artifacts.KIND_VOCALS))
+        self.assertTrue(self.store.exists(1, artifacts.KIND_MIX))
+        self.assertEqual(len(decode_calls), 1)
+        self.assertEqual(len(separate_calls), 1)
+
+    def test_reuses_vocal_stem_without_re_separating(self):
+        # Vocal stem already on disk: transcription reruns, decode + Demucs don't.
+        self.store.write_bytes(1, artifacts.KIND_VOCALS, b"VOX")
+        boom = mock.Mock(side_effect=AssertionError("should not run"))
+        with _vocal_stubs(decode=boom, separate=boom):
+            result = self._build()(_song())
+        self.assertEqual(result["melody"]["source"], "demucs+basic-pitch")
+
+    def test_melody_stage_skips_when_already_present(self):
+        # Pre-seed a stored melody: no audio resolve, no transcription.
+        self.store.write_json(1, artifacts.KIND_MELODY, {"notes": [{"start_ms": 0, "end_ms": 500, "midi": 60}], "source": "demucs+basic-pitch"})
+        resolve = mock.Mock(side_effect=AssertionError("audio should not be resolved"))
+        result = self._build(resolve_audio_url=resolve)(_song())
+        resolve.assert_not_called()
+        self.assertEqual(result["melody"]["notes"][0]["midi"], 60)
+        self.assertTrue(self.store.exists(1, artifacts.KIND_MIDI))  # regenerated
+
+    def test_unavailable_yields_no_melody_but_song_succeeds(self):
+        # No torch/Demucs installed -> no guide, deliberately NO full-mix
+        # fallback. The song is still fully processed (lyrics + video).
+        resolve = mock.Mock(side_effect=AssertionError("no audio resolve without the vocal path"))
+        with _vocal_stubs(available=False):
+            result = self._build(resolve_audio_url=resolve)(_song())
+        self.assertIsNone(result["melody"])
+        self.assertEqual(result["video_id"], "vid123")
+        self.assertEqual({a["kind"] for a in result["artifacts"]}, {"lyrics"})
+        resolve.assert_not_called()
+
+    def test_vocal_failure_yields_no_melody(self):
+        with _vocal_stubs(decode=mock.Mock(side_effect=RuntimeError("demucs blew up"))):
+            result = self._build()(_song())
+        self.assertIsNone(result["melody"])
+        self.assertEqual(result["video_id"], "vid123")  # song still succeeds
+
+    def test_no_ytmusic_id_skips_melody(self):
+        resolve = mock.Mock()
+        with _vocal_stubs():
+            result = self._build(resolve_audio_url=resolve)(_song(ytmusic_video_id=None))
+        self.assertIsNone(result["melody"])
+        resolve.assert_not_called()
+
+    def test_notes_are_gated_to_lyrics(self):
+        gated = mock.Mock(return_value=[{"start_ms": 0, "end_ms": 500, "midi": 60}])
+        with _vocal_stubs(), mock.patch.object(pipeline, "gate_notes_to_lyrics", gated):
+            result = self._build()(_song())
+        gated.assert_called_once()
+        self.assertEqual(result["melody"]["notes"], [{"start_ms": 0, "end_ms": 500, "midi": 60}])
+
+
+class ProcessingReportTestCase(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = artifacts.ArtifactStore(tmp.name)
+
+    def _build(self, **overrides):
+        steps = {
+            "fetch_lyrics": lambda a, t, d: LYRICS,
+            "find_video": lambda a, t, d: VIDEO,
+            "resolve_audio_url": lambda ytm: f"https://audio/{ytm}",
+        }
+        steps.update(overrides)
+        return pipeline.build_processor(self.store, **steps)
+
+    def test_happy_path_reports_every_stage_ok(self):
+        with _vocal_stubs():
+            report = self._build()(_song())["report"]
+        self.assertEqual(report["lyrics"]["status"], "ok")
+        self.assertEqual(report["video"]["status"], "ok")
+        self.assertEqual(report["melody"]["status"], "ok")
+        self.assertIn("1 synced lines from lrclib", report["lyrics"]["detail"])
+        self.assertIn("notes from the isolated vocal", report["melody"]["detail"])
+
+    def test_reports_melody_skipped_without_addon(self):
+        with _vocal_stubs(available=False):
+            report = self._build()(_song())["report"]
+        self.assertEqual(report["melody"]["status"], "skipped")
+        self.assertIn("add-on", report["melody"]["detail"])
+
+    def test_reports_melody_skipped_without_source_id(self):
+        with _vocal_stubs():
+            report = self._build()(_song(ytmusic_video_id=None))["report"]
+        self.assertEqual(report["melody"]["status"], "skipped")
+        self.assertIn("no source-recording id", report["melody"]["detail"])
+
+    def test_reports_melody_failed_with_reason(self):
+        with _vocal_stubs(decode=mock.Mock(side_effect=RuntimeError("ffmpeg exploded"))):
+            report = self._build()(_song())["report"]
+        self.assertEqual(report["melody"]["status"], "failed")
+        self.assertIn("ffmpeg exploded", report["melody"]["detail"])
+
+    def test_hard_failure_carries_partial_report_on_exception(self):
+        process = self._build(find_video=lambda a, t, d: None)
+        try:
+            process(_song())
+            self.fail("expected ProcessingError")
+        except library.ProcessingError as exc:
+            self.assertEqual(exc.report["lyrics"]["status"], "ok")  # lyrics passed before video failed
+            self.assertEqual(exc.report["video"]["status"], "failed")
+
+
+class TempoTestCase(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = artifacts.ArtifactStore(tmp.name)
+
+    def _build(self):
+        return pipeline.build_processor(
+            self.store,
+            fetch_lyrics=lambda a, t, d: LYRICS,
+            find_video=lambda a, t, d: VIDEO,
+            resolve_audio_url=lambda ytm: f"https://audio/{ytm}",
+        )
+
+    def test_bpm_estimated_stored_and_reported(self):
+        with _vocal_stubs(), mock.patch.object(pipeline.tempo, "available", return_value=True), mock.patch.object(
+            pipeline.tempo, "estimate_bpm", return_value=128.0
+        ) as est:
+            result = self._build()(_song())
+
+        self.assertEqual(result["melody"]["bpm"], 128.0)
+        self.assertEqual(result["report"]["tempo"], {"status": "ok", "detail": "128.0 BPM"})
+        # BPM was estimated from the decoded full mix, not the vocal stem.
+        self.assertTrue(est.call_args.args[0].endswith("mix.wav"))
+        # The stored melody carries the BPM (so reuse/MIDI use it).
+        self.assertEqual(self.store.read_json(1, artifacts.KIND_MELODY)["bpm"], 128.0)
+
+    def test_tempo_skipped_without_librosa(self):
+        with _vocal_stubs(), mock.patch.object(pipeline.tempo, "available", return_value=False):
+            result = self._build()(_song())
+        self.assertIsNone(result["melody"]["bpm"])
+        self.assertEqual(result["report"]["tempo"]["status"], "skipped")
+
+    def test_tempo_failure_is_best_effort(self):
+        with _vocal_stubs(), mock.patch.object(pipeline.tempo, "available", return_value=True), mock.patch.object(
+            pipeline.tempo, "estimate_bpm", side_effect=RuntimeError("librosa boom")
+        ):
+            result = self._build()(_song())
+        self.assertIsNone(result["melody"]["bpm"])
+        self.assertEqual(result["report"]["tempo"]["status"], "failed")
+
+    def test_midi_uses_estimated_tempo(self):
+        from core import midi
+
+        with _vocal_stubs(), mock.patch.object(pipeline.tempo, "available", return_value=True), mock.patch.object(
+            pipeline.tempo, "estimate_bpm", return_value=90.0
+        ):
+            self._build()(_song())
+
+        # A note-off one beat long should land at ticks_per_beat regardless of
+        # BPM, but the tempo META event encodes the BPM - decode it to confirm
+        # 90 BPM (666667 microseconds/beat) was written, not the 120 default.
+        with open(self.store.path(1, artifacts.KIND_MIDI), "rb") as handle:
+            data = handle.read()
+        expected = (round(60_000_000 / 90.0)).to_bytes(3, "big")
+        self.assertIn(b"\xff\x51\x03" + expected, data)
+
+
+class GateNotesToLyricsTestCase(unittest.TestCase):
+    NOTES = [
+        {"start_ms": 0, "end_ms": 2000, "midi": 45},  # instrumental intro
+        {"start_ms": 10200, "end_ms": 11000, "midi": 60},  # during line 1
+        {"start_ms": 30000, "end_ms": 31000, "midi": 50},  # instrumental break
+        {"start_ms": 60500, "end_ms": 61500, "midi": 62},  # long after last line
+    ]
+    LYRICS = [
+        {"time_ms": 10000, "text": "line one"},
+        {"time_ms": 12000, "text": "line two ends the vocals"},
+    ]
+
+    def test_notes_outside_sung_sections_are_dropped(self):
+        gated = pipeline.gate_notes_to_lyrics(self.NOTES, self.LYRICS)
+        self.assertEqual([n["start_ms"] for n in gated], [10200])
+
+    def test_lead_in_before_a_line_is_kept(self):
+        notes = [{"start_ms": 9500, "end_ms": 9900, "midi": 60}]  # 500ms early
+        self.assertEqual(len(pipeline.gate_notes_to_lyrics(notes, self.LYRICS)), 1)
+
+    def test_no_lyrics_passes_notes_through(self):
+        self.assertEqual(pipeline.gate_notes_to_lyrics(self.NOTES, []), self.NOTES)
+        self.assertEqual(pipeline.gate_notes_to_lyrics(self.NOTES, None), self.NOTES)
+
+    def test_last_line_window_is_capped(self):
+        notes = [{"start_ms": 27500, "end_ms": 28500, "midi": 60}]  # 15s after final line
+        self.assertEqual(pipeline.gate_notes_to_lyrics(notes, self.LYRICS), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

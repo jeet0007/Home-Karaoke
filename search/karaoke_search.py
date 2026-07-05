@@ -5,7 +5,8 @@ import os
 import re
 import subprocess
 
-BINARY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "binaries", "yt-dlp")
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BINARY_PATH = os.path.join(_PROJECT_ROOT, "binaries", "yt-dlp")
 
 # Substrings checked against the lowercased title.
 BOOST_KEYWORDS = {
@@ -86,10 +87,6 @@ class KaraokeSearch:
     def search(self, query, max_results=10):
         """Search for karaoke versions of `query` (auto-appends "karaoke")."""
         return self._run_search(f"{query} karaoke", max_results)
-
-    def search_raw(self, query, max_results=10):
-        """Search YouTube with the query exactly as given, no karaoke bias."""
-        return self._run_search(query, max_results)
 
     def _run_search(self, query, max_results):
         if not os.path.isfile(self.binary_path):

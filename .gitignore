@@ -3,3 +3,7 @@ __pycache__/
 .venv/
 sidecar/
 .env
+library.db*
+data/
+.venv*
+.DS_Store

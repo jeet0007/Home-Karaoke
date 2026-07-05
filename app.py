@@ -13,18 +13,21 @@ from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import numpy as np
-from flask import Flask, Response, copy_current_request_context, jsonify, redirect, render_template, request, stream_with_context, url_for
+from flask import Flask, Response, copy_current_request_context, jsonify, render_template, request, send_file, stream_with_context
 from flask_sock import Sock
 from simple_websocket import ConnectionClosed
 
-import lyrica_client
-import waveform
-from audio_grading import RealtimeGrader
-from fallback_search import parse_title_identity_candidates
-from lyrics_filter import filter_candidates_by_lyrics
-from search import KaraokeSearch
-from song_search import SongSearch, SongSearchError
-from song_selection import pick_best_candidate
+from core import artifacts
+from core import library
+from core import pipeline
+from core.audio_grading import RealtimeGrader, parse_melody
+from lyrics import lyrica_client
+from lyrics import lyrics_sources
+from lyrics.lyrics_filter import filter_candidates_by_lyrics
+from search.fallback_search import parse_title_identity_candidates
+from search.karaoke_search import KaraokeSearch
+from search.song_search import SongSearch, SongSearchError
+from search.song_selection import pick_best_candidate
 
 LYRICS_CHECK_CAP = 15
 UNIFIED_SEARCH_DEFAULT_LIMIT = 12
@@ -42,11 +45,24 @@ app = Flask(__name__)
 sock = Sock(app)
 karaoke_search = KaraokeSearch()
 song_search = SongSearch()
+# The "good to go" song library + its processing queue (see library.py).
+# Set LIBRARY_DB to relocate the .db file (e.g. onto a NAS volume).
+song_library = library.SongLibrary(os.environ.get("LIBRARY_DB", library.DEFAULT_DB_PATH))
+# Reusable per-song artifacts (vocal stem, lyrics, MIDI, ...) on disk. Set
+# KARAOKE_DATA_DIR to put them on a roomy NAS volume - they can grow large.
+artifact_store = artifacts.ArtifactStore(os.environ.get("KARAOKE_DATA_DIR", artifacts.DEFAULT_ROOT))
 BINARY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "binaries", "yt-dlp")
 
-VIDEO_ID_PATTERN = re.compile(
-    r"(?:v=|/videos/|embed/|youtu\.be/|/v/|/shorts/|/live/)([A-Za-z0-9_-]{11})"
-)
+SEED_CHARTS_DEFAULT_LIMIT = 20
+SEED_CHARTS_MAX_LIMIT = 50
+LIBRARY_LIST_LIMIT = 500
+LIBRARY_STATUSES = {
+    library.STATUS_PENDING,
+    library.STATUS_PROCESSING,
+    library.STATUS_READY,
+    library.STATUS_FAILED,
+}
+
 VIDEO_ID_ONLY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 # googlevideo.com URLs are signed for the IP that resolved them and expire a few
@@ -59,14 +75,9 @@ _STREAM_EXPIRY_BUFFER_S = 60
 _PROXY_CHUNK_SIZE = 256 * 1024
 _PASSTHROUGH_RESPONSE_HEADERS = ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges")
 
-# Waveform peaks are cheap (a few hundred floats) and, unlike the resolved
-# CDN URL in _STREAM_CACHE, never expire - so this is a plain in-memory
-# video_id -> {"peaks": [...], "duration_s": float} cache with no TTL. It
-# does not survive a restart; that's an acceptable tradeoff for this
-# visualization-only feature (see waveform.py).
-_WAVEFORM_CACHE = {}
-_WAVEFORM_CACHE_LOCK = threading.Lock()
-_WAVEFORM_RESOLVE_TIMEOUT_S = 20
+# Timeout for resolving an audio-only stream URL (the ORIGINAL recording,
+# for melody extraction) via yt-dlp.
+_AUDIO_RESOLVE_TIMEOUT_S = 20
 
 _http_client = httpx.Client(follow_redirects=True, timeout=20.0)
 
@@ -184,32 +195,49 @@ def _get_upstream_stream_url(video_id, timeout=20, force_refresh=False):
     return stream_url, warning
 
 
-def _compute_waveform(video_id, timeout=_WAVEFORM_RESOLVE_TIMEOUT_S):
-    """Resolve an audio-only stream URL for video_id (deliberately not the
-    progressive video+audio URL /stream-proxy plays - see waveform.py) and
-    decode it into a peaks envelope."""
-    youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-    audio_urls = _resolve_stream_urls(youtube_url, "bestaudio/best", timeout)
+# -- Library processing pipeline (background worker) -------------------
+#
+# These are the real implementations of the pipeline steps library.py's
+# worker runs per queued song. They deliberately reuse the exact same code
+# paths the live routes use (karaoke ranking, duration-proximity pick) so a
+# library-processed song and a live-selected one can never disagree about
+# which video/lyrics the user gets.
+
+
+def _library_fetch_lyrics(artist, title, duration_s):
+    return lyrics_sources.get_lyrics_full(artist, title, duration=duration_s)
+
+
+def _library_find_video(artist, title, duration_s):
+    candidates = karaoke_search.search(f"{title} {artist}", max_results=LYRICS_CHECK_CAP)
+    return pick_best_candidate(candidates, duration_s)
+
+
+def _library_resolve_audio_url(ytmusic_video_id):
+    """A playable audio-only URL for the ORIGINAL recording (the ytmusicapi
+    song hit) - the melody source, not the karaoke backing video. Used by the
+    pipeline's vocal-separation and full-mix melody stages."""
+    youtube_url = f"https://www.youtube.com/watch?v={ytmusic_video_id}"
+    audio_urls = _resolve_stream_urls(youtube_url, "bestaudio/best", _AUDIO_RESOLVE_TIMEOUT_S)
     if not audio_urls:
         raise RuntimeError("yt-dlp did not return an audio stream URL")
-
-    pcm = waveform.decode_pcm_from_url(audio_urls[0])
-    return {
-        "peaks": waveform.compute_peaks(pcm),
-        "duration_s": waveform.pcm_duration_s(pcm),
-    }
+    return audio_urls[0]
 
 
-def _get_or_compute_waveform(video_id, timeout=_WAVEFORM_RESOLVE_TIMEOUT_S):
-    with _WAVEFORM_CACHE_LOCK:
-        cached = _WAVEFORM_CACHE.get(video_id)
-    if cached is not None:
-        return cached
-
-    result = _compute_waveform(video_id, timeout=timeout)
-    with _WAVEFORM_CACHE_LOCK:
-        _WAVEFORM_CACHE[video_id] = result
-    return result
+def start_library_worker():
+    """Start the single background queue worker. Called from __main__ only
+    (never on import, so tests and WSGI tooling don't spawn threads), and
+    only in the Werkzeug reloader's serving child - the parent process
+    never handles requests and must not compete for queue jobs."""
+    process = pipeline.build_processor(
+        artifact_store,
+        fetch_lyrics=_library_fetch_lyrics,
+        find_video=_library_find_video,
+        resolve_audio_url=_library_resolve_audio_url,
+    )
+    worker = library.LibraryWorker(song_library, process)
+    worker.start()
+    return worker
 
 
 @app.route("/")
@@ -217,17 +245,10 @@ def index():
     return render_template("index.html")
 
 
-@app.route("/songs")
-def songs():
-    """Retired as its own page in favor of the unified `/` search - redirect
-    so old bookmarks/links still land somewhere useful."""
-    return redirect(url_for("index"), code=301)
-
-
 def _run_karaoke_search(query, limit):
     """Run KaraokeSearch and translate its exceptions into (json, status) error
-    tuples, shared by /search and /video-search which differ only in how they
-    build `query` (raw free text vs. a clean artist/title identity)."""
+    tuples. Used by /unified-search's fallback path and /select-song's
+    server-side video pick."""
     try:
         return karaoke_search.search(query, max_results=limit), None
     except FileNotFoundError as exc:
@@ -236,39 +257,6 @@ def _run_karaoke_search(query, limit):
         return None, (jsonify({"error": str(exc)}), 504)
     except RuntimeError as exc:
         return None, (jsonify({"error": str(exc)}), 502)
-
-
-@app.route("/search")
-def search():
-    query = request.args.get("q", "").strip()
-    if not query:
-        return jsonify({"error": "Missing required query parameter 'q'"}), 400
-
-    limit = request.args.get("limit", 10, type=int) or 10
-    limit = max(1, min(limit, LYRICS_CHECK_CAP))
-
-    results, error = _run_karaoke_search(query, limit)
-    if error:
-        return error
-
-    return jsonify({"query": query, "count": len(results), "results": results})
-
-
-@app.route("/song-search")
-def song_search_route():
-    query = request.args.get("q", "").strip()
-    if not query:
-        return jsonify({"error": "Missing required query parameter 'q'"}), 400
-
-    limit = request.args.get("limit", 10, type=int) or 10
-    limit = max(1, min(limit, LYRICS_CHECK_CAP))
-
-    try:
-        results = song_search.search(query, limit=limit)
-    except SongSearchError as exc:
-        return jsonify({"error": str(exc)}), exc.status_code
-
-    return jsonify({"query": query, "count": len(results), "results": results})
 
 
 @app.route("/song-suggestions")
@@ -295,27 +283,6 @@ def song_suggestions():
         return jsonify({"error": str(exc)}), exc.status_code
 
     return jsonify({"query": query, "count": len(results), "results": results})
-
-
-@app.route("/video-search")
-def video_search():
-    """Find a karaoke video for a known-good song identity (artist/title),
-    reusing the existing yt-dlp karaoke ranking - the song identity is fixed,
-    but the video choice stays flexible/ranked, same as /search."""
-    artist = request.args.get("artist", "").strip()
-    title = request.args.get("title", "").strip()
-    if not artist or not title:
-        return jsonify({"error": "Missing required query parameters 'artist' and 'title'"}), 400
-
-    limit = request.args.get("limit", 10, type=int) or 10
-    limit = max(1, min(limit, LYRICS_CHECK_CAP))
-
-    query = f"{title} {artist}"
-    results, error = _run_karaoke_search(query, limit)
-    if error:
-        return error
-
-    return jsonify({"query": query, "artist": artist, "title": title, "count": len(results), "results": results})
 
 
 def _song_identity(song):
@@ -421,19 +388,6 @@ def unified_search():
     )
 
 
-@app.route("/preview")
-def preview():
-    url = request.args.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "Missing required query parameter 'url'"}), 400
-
-    match = VIDEO_ID_PATTERN.search(url)
-    if not match:
-        return jsonify({"error": "Could not extract a video id from that URL"}), 400
-
-    return jsonify({"embed_url": f"https://www.youtube.com/embed/{match.group(1)}"})
-
-
 def _fetch_metadata_safe(artist, title):
     """lyrica_client.get_metadata already fails open (returns {}) on network/
     parse errors; this only guards against an unexpected exception escaping
@@ -446,7 +400,7 @@ def _fetch_metadata_safe(artist, title):
 
 def _fetch_lyrics_safe(artist, title, duration_hint):
     try:
-        return lyrica_client.get_lyrics_full(artist, title, duration=duration_hint) or {}
+        return lyrics_sources.get_lyrics_full(artist, title, duration=duration_hint) or {}
     except Exception:
         return {}
 
@@ -464,18 +418,47 @@ def _prewarm_stream_cache(video_id):
         pass
 
 
-def _prewarm_waveform(video_id):
-    """Best-effort background compute of _WAVEFORM_CACHE for the video
-    /select-song just picked, so the frontend's likely follow-up /waveform
-    call often finds a warm cache instead of paying decode cost inline.
-    Fire-and-forget, same pattern as _prewarm_stream_cache: on any failure
-    (including a missing ffmpeg binary) the frontend's own /waveform request
-    will surface the error, or the waveform simply never appears - either
-    way playback and lyrics are unaffected."""
-    if not waveform.ffmpeg_available():
-        return
+def _serve_library_song(payload):
+    """/select-song fast path: everything was processed and stored by the
+    library worker, so respond straight from the database - no ytmusicapi/
+    Lyrica/yt-dlp lookups."""
+    video_id = payload["video_id"]
+
+    lyrics_result = payload.get("lyrics") or {}
+    melody_result = payload.get("melody") or {}
+    response = {
+        "artist": payload["artist"],
+        "title": payload["title"],
+        "duration_seconds": payload.get("duration_seconds"),
+        "cover_art": payload.get("cover_art", ""),
+        "lyrics": {
+            "synced": lyrics_result.get("synced", []),
+            "plain": lyrics_result.get("plain", ""),
+            "source": lyrics_result.get("source", ""),
+        },
+        "melody": melody_result.get("notes") or None,
+        "bpm": melody_result.get("bpm"),
+        "video_id": video_id,
+        "source": "library",
+    }
+
+    threading.Thread(target=_prewarm_stream_cache, args=(video_id,), daemon=True).start()
+    return jsonify(response)
+
+
+def _enqueue_for_library_safe(artist, title, duration_seconds=None, cover_art="", ytmusic_video_id=None):
+    """Best-effort: every live /select-song also queues the song for full
+    background processing, so the NEXT time it's picked it plays instantly
+    from the library (with a melody guide). Failures never affect the live
+    response the user is waiting on."""
     try:
-        _get_or_compute_waveform(video_id)
+        song_library.enqueue(
+            artist,
+            title,
+            duration_seconds=duration_seconds,
+            cover_art=cover_art,
+            ytmusic_video_id=ytmusic_video_id,
+        )
     except Exception:
         pass
 
@@ -499,8 +482,15 @@ def select_song():
     artist = request.args.get("artist", "").strip()
     title = request.args.get("title", "").strip()
     duration_hint = request.args.get("duration", type=int)
+    ytmusic_video_id = request.args.get("ytmusic_video_id", "").strip() or None
     if not artist or not title:
         return jsonify({"error": "Missing required query parameters 'artist' and 'title'"}), 400
+
+    # Fast path: a fully-processed library song answers instantly from
+    # SQLite (lyrics + video + melody all pre-resolved).
+    library_hit = song_library.find_ready(artist, title)
+    if library_hit and library_hit.get("video_id"):
+        return _serve_library_song(library_hit)
 
     query = f"{title} {artist}"
 
@@ -529,6 +519,16 @@ def select_song():
 
     best = pick_best_candidate(candidates, target_duration)
 
+    # Queue full background processing (lyrics/video/melody stored in the
+    # library) so the next pick of this song takes the fast path.
+    _enqueue_for_library_safe(
+        artist,
+        title,
+        duration_seconds=target_duration,
+        cover_art=metadata.get("cover_art", ""),
+        ytmusic_video_id=ytmusic_video_id,
+    )
+
     response = {
         "artist": artist,
         "title": title,
@@ -539,7 +539,10 @@ def select_song():
             "plain": lyrics_result.get("plain", ""),
             "source": lyrics_result.get("source", ""),
         },
+        "melody": None,
+        "bpm": None,
         "video_id": None,
+        "source": "live",
     }
 
     if best is None:
@@ -548,8 +551,124 @@ def select_song():
 
     response["video_id"] = best["video_id"]
     threading.Thread(target=_prewarm_stream_cache, args=(best["video_id"],), daemon=True).start()
-    threading.Thread(target=_prewarm_waveform, args=(best["video_id"],), daemon=True).start()
     return jsonify(response)
+
+
+# -- Library routes -----------------------------------------------------
+
+
+@app.route("/library")
+def library_index():
+    """Queue + library state in one list: ready songs are the playable
+    library, pending/processing rows are queue progress, failed rows carry
+    their error message."""
+    status = request.args.get("status", "").strip() or None
+    if status is not None and status not in LIBRARY_STATUSES:
+        return jsonify({"error": f"Invalid status; expected one of {sorted(LIBRARY_STATUSES)}"}), 400
+
+    songs = song_library.list_songs(status=status, limit=LIBRARY_LIST_LIMIT)
+    return jsonify({"count": len(songs), "songs": songs})
+
+
+@app.route("/library/add", methods=["POST"])
+def library_add():
+    data = request.get_json(silent=True) or {}
+    artist = str(data.get("artist") or "").strip()
+    title = str(data.get("title") or "").strip()
+    if not artist or not title:
+        return jsonify({"error": "Missing required fields 'artist' and 'title'"}), 400
+
+    duration = data.get("duration_seconds")
+    try:
+        duration = int(duration) if duration is not None else None
+    except (TypeError, ValueError):
+        duration = None
+
+    song = song_library.enqueue(
+        artist,
+        title,
+        album=data.get("album"),
+        duration_seconds=duration,
+        cover_art=str(data.get("cover_art") or ""),
+        ytmusic_video_id=data.get("ytmusic_video_id"),
+    )
+    return jsonify({"song": song}), 202
+
+
+@app.route("/library/song/<int:song_id>")
+def library_song(song_id):
+    payload = song_library.get_full(song_id)
+    if payload is None:
+        return jsonify({"error": "no such song"}), 404
+    return jsonify(payload)
+
+
+@app.route("/song-melody")
+def song_melody():
+    """Cheap poll for a song's reference melody by identity: one indexed
+    lookup, no network. The player calls this while a just-picked song is
+    still being processed in the background (its first /select-song returned
+    melody=null), and renders the note guide the moment it appears - so a
+    first-time song's guide shows up on its own instead of only after a
+    manual reload."""
+    artist = request.args.get("artist", "").strip()
+    title = request.args.get("title", "").strip()
+    if not artist or not title:
+        return jsonify({"error": "Missing required query parameters 'artist' and 'title'"}), 400
+
+    hit = song_library.find_ready(artist, title)
+    melody = (hit or {}).get("melody") if hit else None
+    melody = melody if isinstance(melody, dict) else {}
+    return jsonify({"ready": hit is not None, "melody": melody.get("notes") or None, "bpm": melody.get("bpm")})
+
+
+@app.route("/library/song/<int:song_id>/midi")
+def library_song_midi(song_id):
+    """Download the transcribed melody as a Standard MIDI File - the
+    pipeline's music->MIDI output as a portable product. Presentation only:
+    it serves a stored artifact, never generates one."""
+    artifact = song_library.get_artifact(song_id, artifacts.KIND_MIDI)
+    if artifact is None or not os.path.isfile(artifact["path"]):
+        return jsonify({"error": "no MIDI available for this song"}), 404
+    return send_file(artifact["path"], mimetype="audio/midi", as_attachment=True, download_name=f"song-{song_id}.mid")
+
+
+@app.route("/library/seed-charts", methods=["POST"])
+def library_seed_charts():
+    """Auto-build the library: pull the current top charts from YouTube
+    Music and enqueue every song for background processing. Run it
+    occasionally (or from cron) and the library of good-to-go songs grows
+    on its own."""
+    data = request.get_json(silent=True) or {}
+    limit = data.get("limit", SEED_CHARTS_DEFAULT_LIMIT)
+    try:
+        limit = max(1, min(int(limit), SEED_CHARTS_MAX_LIMIT))
+    except (TypeError, ValueError):
+        limit = SEED_CHARTS_DEFAULT_LIMIT
+    country = str(data.get("country") or "ZZ").strip() or "ZZ"
+
+    try:
+        chart_songs = song_search.charts(country=country, limit=limit)
+    except SongSearchError as exc:
+        return jsonify({"error": str(exc)}), exc.status_code
+
+    enqueued = []
+    for entry in chart_songs:
+        try:
+            enqueued.append(
+                song_library.enqueue(
+                    entry["artist"],
+                    entry["title"],
+                    album=entry.get("album"),
+                    duration_seconds=entry.get("duration_seconds"),
+                    cover_art=entry.get("cover_art", ""),
+                    ytmusic_video_id=entry.get("ytmusic_video_id"),
+                )
+            )
+        except ValueError:
+            continue
+
+    return jsonify({"country": country, "count": len(enqueued), "songs": enqueued}), 202
 
 
 @app.route("/player")
@@ -557,12 +676,17 @@ def player():
     title = request.args.get("title", "").strip() or "Untitled"
     artist = request.args.get("artist", "").strip() or "Unknown artist"
     duration = request.args.get("duration", "").strip()
+    # The ytmusicapi video id of the ORIGINAL recording, forwarded to
+    # /select-song so the library worker can extract a reference melody
+    # from it (see pipeline.py's melody stage).
+    ytmusic_video_id = request.args.get("ytm", "").strip()
 
     return render_template(
         "player.html",
         title=title,
         artist=artist,
         duration=duration,
+        ytmusic_video_id=ytmusic_video_id,
     )
 
 
@@ -647,35 +771,6 @@ def stream_proxy(video_id):
     return Response(stream_with_context(generate()), status=upstream.status_code, headers=headers)
 
 
-@app.route("/waveform/<video_id>")
-def waveform_route(video_id):
-    """Coarse peak envelope for the player's waveform visualization - see
-    waveform.py for why this decodes its own audio-only stream rather than
-    reusing /stream-proxy's progressive video+audio one. Purely additive: on
-    any failure here the frontend just doesn't draw a waveform, playback and
-    lyrics are unaffected."""
-    video_id = video_id.strip()
-    if not VIDEO_ID_ONLY_PATTERN.match(video_id):
-        return jsonify({"error": "Invalid YouTube video id"}), 400
-
-    if not os.path.isfile(BINARY_PATH):
-        return jsonify({"error": f"yt-dlp binary not found at {BINARY_PATH}"}), 500
-
-    if not waveform.ffmpeg_available():
-        return jsonify({"error": "ffmpeg is not installed on this server"}), 503
-
-    try:
-        result = _get_or_compute_waveform(video_id)
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Timed out while generating the waveform"}), 504
-    except OSError as exc:
-        return jsonify({"error": f"failed to execute yt-dlp: {exc}"}), 500
-    except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 502
-
-    return jsonify(result)
-
-
 @sock.route("/grade")
 def grade(ws):
     """Streams live pitch/energy performance scores while the user sings
@@ -686,10 +781,15 @@ def grade(ws):
 
     Protocol: the client's first message must be a JSON text frame
     {"sample_rate": <int>} matching the AudioContext sample rate it
-    captured at. Every message after that is a binary frame of raw
-    little-endian float32 mono PCM samples. The server replies with one
-    JSON text frame per score update produced (a few times a second),
-    shaped like audio_grading.RealtimeGrader.push_samples()'s output.
+    captured at; it may also carry "melody" (reference note segments from
+    /select-song, see vocal_transcribe.py) to enable melody-accuracy grading. Every
+    message after that is either a binary frame of raw little-endian
+    float32 mono PCM samples, or a JSON text frame {"pos_ms": <number>}
+    syncing the backing track's current playback position (required for
+    the melody to line up with the mic stream; harmless without one). The
+    server replies with one JSON text frame per score update produced (a
+    few times a second), shaped like
+    audio_grading.RealtimeGrader.push_samples()'s output.
     """
     try:
         handshake_raw = ws.receive()
@@ -705,16 +805,22 @@ def grade(ws):
             ws.send(json.dumps({"error": 'First message must be JSON {"sample_rate": <int>}'}))
             return
 
-        grader = RealtimeGrader(sample_rate)
+        melody_notes = parse_melody(handshake.get("melody")) if isinstance(handshake, dict) else None
+        grader = RealtimeGrader(sample_rate, melody=melody_notes)
 
         while True:
             message = ws.receive()
             if message is None:
                 break
             if isinstance(message, str):
-                # Ignore stray text frames (e.g. a client-side keepalive)
-                # rather than tearing down the session over a non-PCM
-                # message.
+                # Position syncs arrive as text frames; anything else
+                # non-PCM (e.g. a client-side keepalive) is ignored rather
+                # than tearing down the session.
+                try:
+                    payload = json.loads(message)
+                    grader.set_position(float(payload["pos_ms"]))
+                except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                    pass
                 continue
 
             try:
@@ -738,7 +844,7 @@ def lyrics():
     if not artist or not title:
         return jsonify({"error": "Missing required query parameters 'artist' and 'title'"}), 400
 
-    result = lyrica_client.get_lyrics_full(artist, title, duration=duration)
+    result = lyrics_sources.get_lyrics_full(artist, title, duration=duration)
     if not result:
         return jsonify({"error": "no lyrics found"}), 404
 
@@ -770,5 +876,11 @@ if __name__ == "__main__":
     except (RuntimeError, ValueError) as exc:
         print(exc, file=sys.stderr)
         sys.exit(1)
+
+    # Only the reloader's serving child (WERKZEUG_RUN_MAIN=true) runs the
+    # queue worker - the reloader parent never serves requests and two
+    # workers would double-process every queued song.
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        start_library_worker()
 
     app.run(host=app_host, port=app_port, debug=True, threaded=True)

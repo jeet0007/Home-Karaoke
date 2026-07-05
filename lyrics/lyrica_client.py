@@ -132,8 +132,8 @@ def _fetch_lyrics_data(artist, title):
     synced-lyrics source list (see LYRICS_FULL_FETCH_SEQUENCE) and return its
     `data` payload, or None.
 
-    Used for real, one-shot lookups on a single confirmed song (get_lyrics,
-    get_lyrics_full) - as opposed to check_lyrics_available's pre-selection
+    Used for a real, one-shot lookup on a single confirmed song
+    (get_lyrics_full) - as opposed to check_lyrics_available's pre-selection
     checks over many unpicked candidates, which default to a cheaper,
     narrower mode (see lyrics_filter.py)."""
     params = {
@@ -160,23 +160,6 @@ def _fetch_lyrics_data(artist, title):
         return None
 
     return payload.get("data") or {}
-
-
-def get_lyrics(artist, title, duration=None):
-    """Return synced lyrics as [{"time_ms": int, "text": str}], or [] if unavailable.
-
-    Prefers timestamped lyrics; returns [] if Lyrica only has plain lyrics
-    or nothing at all (use get_lyrics_full() for the plain-text fallback).
-    """
-    data = _fetch_lyrics_data(artist, title)
-    if not data:
-        return []
-
-    timed = data.get("timed_lyrics") or []
-    return [
-        {"time_ms": _as_time_ms(line.get("start_time")), "text": line.get("text", "")}
-        for line in timed
-    ]
 
 
 def get_lyrics_full(artist, title, duration=None):

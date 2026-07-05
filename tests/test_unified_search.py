@@ -6,7 +6,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app as app_module  # noqa: E402
-from song_search import SongSearchError  # noqa: E402
+from search.song_search import SongSearchError  # noqa: E402
 
 CLEAN_SONG = {
     "artist": "Passenger",
@@ -131,7 +131,7 @@ class UnifiedSearchRouteTestCase(unittest.TestCase):
         mock_song_search.return_value = []
         mock_karaoke_search.return_value = [dict(VIDEO_RESULT)]
 
-        with patch("lyrica_client.check_lyrics_available") as mock_check:
+        with patch("lyrics.lyrica_client.check_lyrics_available") as mock_check:
             mock_check.side_effect = lambda artist, title, timeout=None, **kwargs: (artist, title) == ("Passenger", "Let Her Go")
             resp = self.client.get("/unified-search?q=anything")
 
@@ -176,13 +176,6 @@ class UnifiedSearchRouteTestCase(unittest.TestCase):
         resp = self.client.get("/unified-search?q=anything")
 
         self.assertEqual(resp.status_code, 502)
-
-    # -- /songs retired in favor of the unified `/` page -------------------
-
-    def test_songs_redirects_to_home(self):
-        resp = self.client.get("/songs")
-        self.assertIn(resp.status_code, (301, 302))
-        self.assertTrue(resp.headers["Location"].endswith("/"))
 
     def test_home_page_renders(self):
         resp = self.client.get("/")

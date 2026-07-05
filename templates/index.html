@@ -247,6 +247,67 @@
     color: var(--muted);
     padding: 3rem 1rem;
   }
+
+  .library-section {
+    margin-top: 2.5rem;
+  }
+
+  .library-section[hidden] { display: none; }
+
+  .library-heading {
+    margin: 0 0 0.75rem;
+    font-size: 1.05rem;
+    color: var(--muted);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+
+  .library-heading span { color: var(--text); }
+
+  .status-chip {
+    flex-shrink: 0;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.2rem 0.6rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    text-transform: capitalize;
+  }
+
+  .status-chip.ready { color: var(--good); border-color: var(--good); }
+  .status-chip.failed { color: var(--accent); border-color: var(--accent); }
+  .status-chip.processing,
+  .status-chip.pending { color: var(--warn); border-color: var(--warn); }
+
+  .song-row.not-playable { cursor: default; }
+
+  .song-row.not-playable:hover {
+    background: var(--panel);
+    border-color: var(--border);
+  }
+
+  .stage-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-top: 0.4rem;
+  }
+
+  .stage-badge {
+    font-size: 0.68rem;
+    font-weight: 600;
+    padding: 0.08rem 0.4rem;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  .stage-badge.ok,
+  .stage-badge.reused { color: var(--good); border-color: var(--accent-dim); }
+  .stage-badge.failed { color: var(--accent); border-color: var(--accent-dim); }
+  .stage-badge.skipped { color: var(--muted); }
 </style>
 </head>
 <body>
@@ -268,6 +329,14 @@
   <div id="warning-banner"></div>
   <div id="status"></div>
   <div id="results" class="list"></div>
+
+  <!-- The song library (see library.py): ready songs play instantly with a
+       melody note guide, pending/processing rows show the background queue
+       at work, failed rows say why. Hidden entirely until it has rows. -->
+  <section id="library-section" class="library-section" hidden>
+    <h2 class="library-heading">Library <span id="library-count"></span></h2>
+    <div id="library-list" class="list"></div>
+  </section>
 </main>
 
 <script>
@@ -316,7 +385,7 @@
     const meta = [song.album, formatDuration(song.duration_seconds)].filter(Boolean).join(' · ');
     const thumb = song.cover_art || '';
     return `
-      <div class="song-row" data-artist="${escapeHtml(song.artist)}" data-title="${escapeHtml(song.title)}" data-duration="${song.duration_seconds != null ? song.duration_seconds : ''}">
+      <div class="song-row" data-artist="${escapeHtml(song.artist)}" data-title="${escapeHtml(song.title)}" data-duration="${song.duration_seconds != null ? song.duration_seconds : ''}" data-ytm="${escapeHtml(song.ytmusic_video_id || '')}">
         ${thumb ? `<img class="song-thumb" src="${escapeHtml(thumb)}" loading="lazy" alt="">` : ''}
         <div class="song-info">
           <div class="song-title">${escapeHtml(song.title)} <span style="color: var(--muted);">&mdash; ${escapeHtml(song.artist)}</span></div>
@@ -328,10 +397,13 @@
 
   // Picking a song is the whole journey now - no separate video-picking step.
   // The player page resolves and auto-picks the karaoke video itself via
-  // /select-song once it loads.
-  function openPlayer(artist, title, duration) {
+  // /select-song once it loads. `ytm` (the original recording's YouTube
+  // Music video id) rides along so the library worker can extract a
+  // reference melody for the note guide.
+  function openPlayer(artist, title, duration, ytmusicVideoId) {
     const params = new URLSearchParams({ artist, title });
     if (duration) params.set('duration', duration);
+    if (ytmusicVideoId) params.set('ytm', ytmusicVideoId);
     window.location.href = `/player?${params.toString()}`;
   }
 
@@ -439,7 +511,7 @@
 
   function selectSuggestion(song) {
     closeSuggestions();
-    openPlayer(song.artist, song.title, song.duration_seconds);
+    openPlayer(song.artist, song.title, song.duration_seconds, song.ytmusic_video_id);
   }
 
   function moveActiveSuggestion(delta) {
@@ -488,7 +560,7 @@
   resultsEl.addEventListener('click', (e) => {
     const songRow = e.target.closest('.song-row');
     if (songRow) {
-      openPlayer(songRow.dataset.artist, songRow.dataset.title, songRow.dataset.duration);
+      openPlayer(songRow.dataset.artist, songRow.dataset.title, songRow.dataset.duration, songRow.dataset.ytm);
     }
   });
 
@@ -535,6 +607,98 @@
   document.addEventListener('click', (e) => {
     if (!e.target.closest('.search-bar-wrapper')) closeSuggestions();
   });
+
+  // -- Song library ------------------------------------------------------
+  //
+  // GET /library returns every stored song with its queue status. Ready
+  // songs play instantly (the player takes /select-song's library fast
+  // path, complete with the melody note guide); pending/processing rows
+  // show the background worker's progress and auto-refresh until they
+  // settle; failed rows carry the reason.
+  const librarySection = document.getElementById('library-section');
+  const libraryCountEl = document.getElementById('library-count');
+  const libraryListEl = document.getElementById('library-list');
+
+  const LIBRARY_REFRESH_MS = 10000;
+  let libraryRefreshTimer = null;
+
+  // Per-stage outcome badges (lyrics / video / guide), from the song's
+  // `stages` map. Answers "what passed and what failed" at a glance; full
+  // reasons are in GET /library/song/<id>'s `report`.
+  const STAGE_LABELS = { lyrics: 'lyrics', video: 'backing', melody: 'guide' };
+  const STAGE_GLYPH = { ok: '✓', reused: '✓', skipped: '–', failed: '✗' };
+
+  function renderStageBadges(stages) {
+    const entries = Object.entries(stages || {});
+    if (entries.length === 0) return '';
+    const badges = entries
+      .map(([stage, status]) => {
+        const label = STAGE_LABELS[stage] || stage;
+        const glyph = STAGE_GLYPH[status] || '?';
+        return `<span class="stage-badge ${escapeHtml(status)}" title="${escapeHtml(stage)}: ${escapeHtml(status)}">${glyph} ${escapeHtml(label)}</span>`;
+      })
+      .join('');
+    return `<div class="stage-badges">${badges}</div>`;
+  }
+
+  function renderLibraryRow(song) {
+    const playable = song.status === 'ready';
+    const metaParts = [song.album, formatDuration(song.duration_seconds)];
+    if (song.status === 'failed' && song.error) metaParts.push(song.error);
+    const meta = metaParts.filter(Boolean).join(' · ');
+    const thumb = song.cover_art || '';
+    return `
+      <div class="song-row${playable ? '' : ' not-playable'}" data-playable="${playable ? '1' : ''}" data-artist="${escapeHtml(song.artist)}" data-title="${escapeHtml(song.title)}" data-duration="${song.duration_seconds != null ? song.duration_seconds : ''}">
+        ${thumb ? `<img class="song-thumb" src="${escapeHtml(thumb)}" loading="lazy" alt="">` : ''}
+        <div class="song-info">
+          <div class="song-title">${escapeHtml(song.title)} <span style="color: var(--muted);">&mdash; ${escapeHtml(song.artist)}</span></div>
+          ${meta ? `<div class="song-meta">${escapeHtml(meta)}</div>` : ''}
+          ${renderStageBadges(song.stages)}
+        </div>
+        <span class="status-chip ${escapeHtml(song.status)}">${escapeHtml(song.status)}</span>
+      </div>
+    `;
+  }
+
+  async function loadLibrary() {
+    try {
+      const res = await fetch('/library');
+      if (!res.ok) return;
+      const data = await res.json();
+      const songs = data.songs || [];
+
+      if (songs.length === 0) {
+        librarySection.hidden = true;
+        return;
+      }
+
+      const readyCount = songs.filter((s) => s.status === 'ready').length;
+      libraryCountEl.textContent = `(${readyCount} ready of ${songs.length})`;
+      libraryListEl.innerHTML = songs.map(renderLibraryRow).join('');
+      librarySection.hidden = false;
+
+      // Keep polling only while the background worker still has songs in
+      // flight; a settled library stops generating requests.
+      const inFlight = songs.some((s) => s.status === 'pending' || s.status === 'processing');
+      if (inFlight && libraryRefreshTimer === null) {
+        libraryRefreshTimer = setTimeout(() => {
+          libraryRefreshTimer = null;
+          loadLibrary();
+        }, LIBRARY_REFRESH_MS);
+      }
+    } catch (err) {
+      // Best-effort - search works fine without the library strip.
+    }
+  }
+
+  libraryListEl.addEventListener('click', (e) => {
+    const songRow = e.target.closest('.song-row');
+    if (songRow && songRow.dataset.playable) {
+      openPlayer(songRow.dataset.artist, songRow.dataset.title, songRow.dataset.duration);
+    }
+  });
+
+  loadLibrary();
 </script>
 
 </body>

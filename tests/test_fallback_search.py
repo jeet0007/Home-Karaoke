@@ -4,7 +4,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from fallback_search import clean_title, parse_title_identity_candidates  # noqa: E402
+from search.fallback_search import clean_title, parse_title_identity_candidates  # noqa: E402
 
 # Real yt-dlp karaoke search results (ytsearch, --dump-json --flat-playlist)
 # verified against "Let Her Go Passenger karaoke", "Bohemian Rhapsody Queen

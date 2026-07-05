@@ -8,9 +8,9 @@ import httpx
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import lyrica_client  # noqa: E402
-import lyrics_filter  # noqa: E402
-from lyrics_filter import filter_candidates_by_lyrics  # noqa: E402
+from lyrics import lyrica_client  # noqa: E402
+from lyrics import lyrics_filter  # noqa: E402
+from lyrics.lyrics_filter import filter_candidates_by_lyrics  # noqa: E402
 
 
 def _song_identity(song):
@@ -35,7 +35,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
     def _songs(self, n):
         return [{"artist": f"Artist {i}", "title": f"Song {i}"} for i in range(n)]
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_keeps_has_lyrics_drops_no_lyrics(self, mock_check):
         songs = self._songs(3)
         # song 0 has lyrics, song 1 doesn't, song 2 has lyrics
@@ -46,7 +46,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         self.assertEqual([s["title"] for s in kept], ["Song 0", "Song 2"])
         self.assertFalse(degraded)
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_excludes_candidate_on_lyrica_error_instead_of_failing_open(self, mock_check):
         songs = self._songs(2)
 
@@ -65,7 +65,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         self.assertEqual({s["title"] for s in kept}, {"Song 1"})
         self.assertFalse(degraded)
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_single_candidate_error_amid_healthy_batch_is_not_degraded(self, mock_check):
         # 1 error out of 15 (~7%) is well under the systemic threshold -
         # this is "this one candidate had a hiccup", not "Lyrica is down".
@@ -84,7 +84,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         self.assertNotIn("Song 0", {s["title"] for s in kept})
         self.assertFalse(degraded)
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_degraded_true_when_error_ratio_crosses_threshold(self, mock_check):
         # 12/15 (80%) erroring is the "Lyrica itself is unreachable" shape:
         # unrelated songs failing together points at a shared failure point,
@@ -104,7 +104,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         self.assertEqual({s["title"] for s in kept}, {"Song 12", "Song 13", "Song 14"})
         self.assertTrue(degraded)
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_degraded_true_when_every_check_errors(self, mock_check):
         songs = self._songs(3)
         mock_check.side_effect = _non_timeout_error("service down")
@@ -114,7 +114,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         self.assertEqual(kept, [])  # unverified candidates are excluded, not kept
         self.assertTrue(degraded)
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_retries_once_on_timeout_then_succeeds(self, mock_check):
         calls = {"Song 0": 0}
 
@@ -135,7 +135,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         self.assertEqual(calls["Song 0"], 2)  # one retry happened
         self.assertFalse(degraded)
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_timeout_retry_is_bounded_then_excludes(self, mock_check):
         # Every attempt times out - the retry budget (1) is spent and the
         # candidate is still excluded, not kept.
@@ -147,7 +147,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         self.assertEqual(kept, [])
         self.assertEqual(mock_check.call_count, 2)  # original attempt + 1 retry
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_non_timeout_error_is_not_retried(self, mock_check):
         mock_check.side_effect = lambda artist, title, timeout=None, **kwargs: (_ for _ in ()).throw(_non_timeout_error())
         songs = self._songs(1)
@@ -157,7 +157,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         self.assertEqual(kept, [])
         self.assertEqual(mock_check.call_count, 1)  # no retry for a non-timeout error
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_caps_number_of_candidates_checked(self, mock_check):
         songs = self._songs(20)
         mock_check.return_value = True
@@ -167,7 +167,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         self.assertEqual(mock_check.call_count, 5)
         self.assertEqual(len(kept), 5)
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_tries_each_identity_guess_until_one_resolves(self, mock_check):
         video = {"title": "Let Her Go - Passenger (Karaoke Version)"}
 
@@ -185,7 +185,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         self.assertEqual(kept[0]["_resolved_identity"], ("Passenger", "Let Her Go"))
         self.assertFalse(degraded)
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_drops_candidate_when_no_identity_guess_has_lyrics(self, mock_check):
         video = {"title": "Untitled Karaoke Track"}
 
@@ -205,7 +205,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         self.assertEqual(kept, [])
         self.assertFalse(degraded)
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_checks_run_concurrently_not_serialized(self, mock_check):
         # Each check "blocks" for 0.2s; 8 candidates run sequentially would take
         # ~1.6s. With the default thread pool they should overlap heavily.
@@ -223,7 +223,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         self.assertEqual(len(kept), 8)
         self.assertLess(elapsed, 0.6)  # well under the ~1.6s serial baseline
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_preserves_original_candidate_order(self, mock_check):
         # Earlier candidates take longer, so a naive as-completed collection
         # would reorder them - results must come back in input order regardless.
@@ -240,7 +240,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
 
         self.assertEqual([s["title"] for s in kept], ["Song 0", "Song 1", "Song 2"])
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_uses_lrclib_only_check_by_default(self, mock_check):
         # Pre-selection candidate checks must ask Lyrica for its
         # pass=true&sequence=2 mode (LRCLIB only) rather than fast=true
@@ -256,7 +256,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         self.assertEqual(kwargs["sequence"], lyrics_filter.LRCLIB_FETCHER_ID)
         self.assertNotIn("fast", kwargs)
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_check_mode_can_be_switched_to_fast_via_env_var(self, mock_check):
         # LYRICS_FILTER_CHECK_MODE is read from the env var once at import
         # time; patch the resolved module attribute directly rather than
@@ -272,7 +272,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         self.assertTrue(kwargs["fast"])
         self.assertNotIn("sequence", kwargs)
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_default_max_workers_is_gentler_than_previous_default(self, mock_check):
         # Lyrica's backend can only truly process 1-2 requests at once (2
         # sync gunicorn workers in prod, a single-threaded dev server
@@ -281,7 +281,7 @@ class FilterCandidatesByLyricsTestCase(unittest.TestCase):
         # other and helped trip Lyrica's own rate limiter.
         self.assertEqual(lyrics_filter.DEFAULT_MAX_WORKERS, 4)
 
-    @patch("lyrics_filter.lyrica_client.check_lyrics_available")
+    @patch("lyrics.lyrics_filter.lyrica_client.check_lyrics_available")
     def test_submissions_are_staggered_to_avoid_bursting_lyrica(self, mock_check):
         # Checks themselves resolve instantly here, so any measured elapsed
         # time comes purely from the stagger between *submitting* each one -

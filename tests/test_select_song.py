@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -8,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app as app_module  # noqa: E402
+from core import library  # noqa: E402
 
 METADATA = {
     "cover_art": "https://example.com/cover.jpg",
@@ -25,10 +27,30 @@ CANDIDATE_A = {"video_id": "aaa", "score": 20, "duration_seconds": 253}
 CANDIDATE_B = {"video_id": "bbb", "score": 30, "duration_seconds": 800}
 
 
+def _block_lrclib_fallback(test_case):
+    """/select-song's lyrics lookup now falls back to the real LRCLIB API
+    when the (mocked) Lyrica client returns nothing - stub the fallback out
+    so these tests never touch the network. Also swap the module-level song
+    library for a throwaway one so /select-song's library fast-path and
+    background enqueue never touch the real library.db."""
+    patcher = patch("lyrics.lrclib_client.get_lyrics_full", return_value=None)
+    patcher.start()
+    test_case.addCleanup(patcher.stop)
+
+    tmp = tempfile.TemporaryDirectory()
+    test_case.addCleanup(tmp.cleanup)
+    library_patcher = patch.object(
+        app_module, "song_library", library.SongLibrary(os.path.join(tmp.name, "library.db"))
+    )
+    library_patcher.start()
+    test_case.addCleanup(library_patcher.stop)
+
+
 class SelectSongRouteTestCase(unittest.TestCase):
     def setUp(self):
         app_module.app.testing = True
         self.client = app_module.app.test_client()
+        _block_lrclib_fallback(self)
 
     def test_requires_artist_and_title(self):
         resp = self.client.get("/select-song?artist=Passenger")
@@ -139,6 +161,7 @@ class SelectSongRunsLookupsConcurrentlyTestCase(unittest.TestCase):
     def setUp(self):
         app_module.app.testing = True
         self.client = app_module.app.test_client()
+        _block_lrclib_fallback(self)
 
     @patch("app.karaoke_search.search")
     @patch("app.lyrica_client.get_lyrics_full")
@@ -201,6 +224,7 @@ class SelectSongPrewarmsStreamCacheTestCase(unittest.TestCase):
     def setUp(self):
         app_module.app.testing = True
         self.client = app_module.app.test_client()
+        _block_lrclib_fallback(self)
         with app_module._STREAM_CACHE_LOCK:
             app_module._STREAM_CACHE.clear()
 

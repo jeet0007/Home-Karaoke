@@ -123,6 +123,61 @@ class GradeWebSocketTestCase(unittest.TestCase):
             except ConnectionClosed:
                 pass
 
+    def _grade_with_melody(self, samples, melody, pos_ms=0, chunk_ms=20):
+        """Same as _grade_samples but with a reference melody in the
+        handshake and a position sync before the PCM stream."""
+        ws = self._connect()
+        try:
+            ws.send(json.dumps({"sample_rate": SAMPLE_RATE, "melody": melody}))
+            ws.send(json.dumps({"pos_ms": pos_ms}))
+            chunk_n = int(SAMPLE_RATE * chunk_ms / 1000)
+            updates = []
+            for start in range(0, len(samples), chunk_n):
+                ws.send(samples[start : start + chunk_n].tobytes())
+            while True:
+                try:
+                    message = ws.receive(timeout=1)
+                except Exception:
+                    break
+                if message is None:
+                    break
+                updates.append(json.loads(message))
+        finally:
+            try:
+                ws.close()
+            except ConnectionClosed:
+                pass
+        return updates
+
+    def test_melody_handshake_enables_reference_grading(self):
+        melody = [{"start_ms": 0, "end_ms": 60000, "midi": 57}]  # A3 throughout
+
+        on_pitch = self._grade_with_melody(_sine(220.0, seconds=2.0), melody)  # A3
+        off_pitch = self._grade_with_melody(_sine(311.1, seconds=2.0), melody)  # D#4, tritone off
+
+        self.assertTrue(on_pitch and off_pitch)
+        self.assertEqual(on_pitch[-1]["target_midi"], 57)
+        self.assertGreaterEqual(on_pitch[-1]["score"], 80)
+        self.assertGreater(on_pitch[-1]["score"], off_pitch[-1]["score"] + 30)
+
+    def test_garbage_melody_and_sync_frames_do_not_kill_the_session(self):
+        ws = self._connect()
+        try:
+            ws.send(json.dumps({"sample_rate": SAMPLE_RATE, "melody": "not-a-list"}))
+            ws.send("not json at all")
+            ws.send(json.dumps({"pos_ms": "NaN-ish"}))
+            ws.send(_sine(220.0, seconds=0.5).tobytes())
+            message = ws.receive(timeout=2)
+            self.assertIsNotNone(message)
+            update = json.loads(message)
+            self.assertIn("score", update)
+            self.assertIsNone(update["target_midi"])
+        finally:
+            try:
+                ws.close()
+            except ConnectionClosed:
+                pass
+
     def test_disconnect_mid_stream_does_not_crash_server(self):
         ws = self._connect()
         ws.send(json.dumps({"sample_rate": SAMPLE_RATE}))

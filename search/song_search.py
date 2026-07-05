@@ -64,3 +64,24 @@ class SongSearch:
             raise SongSearchError(f"ytmusicapi search failed: {exc}", status_code=status_code) from exc
 
         return [_clean_result(entry) for entry in raw_results if entry.get("videoId")][:limit]
+
+    def charts(self, country="ZZ", limit=20):
+        """Current top-chart songs as clean identities (same shape as
+        search()), for auto-seeding the library. "ZZ" is YouTube Music's
+        global chart; not every country chart carries a "songs" section
+        (some only have "videos"/"trending"), so all three are tried."""
+        try:
+            client = self._get_client()
+            raw_charts = client.get_charts(country=country)
+        except Exception as exc:
+            status_code = 504 if "timed out" in str(exc).lower() or "timeout" in str(exc).lower() else 502
+            raise SongSearchError(f"ytmusicapi charts failed: {exc}", status_code=status_code) from exc
+
+        entries = []
+        for section in ("songs", "videos", "trending"):
+            items = ((raw_charts or {}).get(section) or {}).get("items") or []
+            entries.extend(items)
+            if len(entries) >= limit:
+                break
+
+        return [_clean_result(entry) for entry in entries if entry.get("videoId")][:limit]

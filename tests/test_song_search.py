@@ -4,7 +4,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from song_search import SongSearch, SongSearchError  # noqa: E402
+from search.song_search import SongSearch, SongSearchError  # noqa: E402
 
 RAW_RESULT = {
     "title": "Let Her Go",
