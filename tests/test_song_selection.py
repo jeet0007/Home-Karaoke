@@ -4,7 +4,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from song_selection import (  # noqa: E402
+from search.song_selection import (  # noqa: E402
     DURATION_MISMATCH_PENALTY,
     combined_score,
     duration_proximity_score,

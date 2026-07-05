@@ -6,7 +6,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app as app_module  # noqa: E402
-from song_search import SongSearchError  # noqa: E402
+from search.song_search import SongSearchError  # noqa: E402
 
 CLEAN_SONG = {
     "artist": "Passenger",

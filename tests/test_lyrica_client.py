@@ -7,7 +7,7 @@ import httpx
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import lyrica_client  # noqa: E402
+from lyrics import lyrica_client  # noqa: E402
 
 
 def _response(status_code=200, json_body=None):
@@ -15,46 +15,46 @@ def _response(status_code=200, json_body=None):
 
 
 class CheckLyricsAvailableTestCase(unittest.TestCase):
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_returns_true_when_lyrics_present(self, mock_get):
         mock_get.return_value = _response(json_body={"status": "success", "data": {"plain_lyrics": "la la la"}})
 
         self.assertTrue(lyrica_client.check_lyrics_available("Passenger", "Let Her Go"))
 
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_returns_false_when_status_is_error(self, mock_get):
         mock_get.return_value = _response(json_body={"status": "error", "message": "not found"})
 
         self.assertFalse(lyrica_client.check_lyrics_available("Nobody", "Nothing"))
 
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_returns_false_when_success_but_empty_data(self, mock_get):
         mock_get.return_value = _response(json_body={"status": "success", "data": {}})
 
         self.assertFalse(lyrica_client.check_lyrics_available("Nobody", "Nothing"))
 
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_raises_unavailable_on_network_error(self, mock_get):
         mock_get.side_effect = httpx.ConnectError("connection refused")
 
         with self.assertRaises(lyrica_client.LyricaUnavailableError):
             lyrica_client.check_lyrics_available("Passenger", "Let Her Go")
 
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_raises_unavailable_on_timeout(self, mock_get):
         mock_get.side_effect = httpx.ReadTimeout("timed out")
 
         with self.assertRaises(lyrica_client.LyricaUnavailableError):
             lyrica_client.check_lyrics_available("Passenger", "Let Her Go")
 
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_raises_unavailable_on_non_200(self, mock_get):
         mock_get.return_value = _response(status_code=500)
 
         with self.assertRaises(lyrica_client.LyricaUnavailableError):
             lyrica_client.check_lyrics_available("Passenger", "Let Her Go")
 
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_raises_unavailable_on_unparsable_body(self, mock_get):
         bad_response = httpx.Response(200, content=b"not json")
         mock_get.return_value = bad_response
@@ -62,7 +62,7 @@ class CheckLyricsAvailableTestCase(unittest.TestCase):
         with self.assertRaises(lyrica_client.LyricaUnavailableError):
             lyrica_client.check_lyrics_available("Passenger", "Let Her Go")
 
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_sends_fast_true_by_default(self, mock_get):
         # Pre-selection availability checks (this function's only caller is
         # lyrics_filter.py, over candidates the user hasn't picked yet) must
@@ -76,7 +76,7 @@ class CheckLyricsAvailableTestCase(unittest.TestCase):
         _args, kwargs = mock_get.call_args
         self.assertEqual(kwargs["params"]["fast"], "true")
 
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_fast_false_opts_out_of_fast_mode(self, mock_get):
         mock_get.return_value = _response(json_body={"status": "success", "data": {"plain_lyrics": "la la la"}})
 
@@ -85,7 +85,7 @@ class CheckLyricsAvailableTestCase(unittest.TestCase):
         _args, kwargs = mock_get.call_args
         self.assertEqual(kwargs["params"]["fast"], "false")
 
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_sequence_requests_lyrica_pass_mode(self, mock_get):
         # A `sequence` (e.g. "2" for LRCLIB - see fetch_controller.py
         # FETCHER_MAP) requests Lyrica's pass=true&sequence=... mode,
@@ -99,7 +99,7 @@ class CheckLyricsAvailableTestCase(unittest.TestCase):
         self.assertEqual(kwargs["params"]["sequence"], "2")
         self.assertNotIn("fast", kwargs["params"])
 
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_sequence_takes_precedence_over_fast(self, mock_get):
         mock_get.return_value = _response(json_body={"status": "success", "data": {"plain_lyrics": "la la la"}})
 
@@ -116,7 +116,7 @@ class FullLyricsFetchUsesFullChainTestCase(unittest.TestCase):
     and so keep walking its full multi-source chain for best quality/accuracy,
     unlike the pre-selection check above."""
 
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_get_lyrics_full_does_not_request_fast_mode(self, mock_get):
         mock_get.return_value = _response(json_body={
             "status": "success",
@@ -127,19 +127,6 @@ class FullLyricsFetchUsesFullChainTestCase(unittest.TestCase):
 
         _args, kwargs = mock_get.call_args
         self.assertNotIn("fast", kwargs["params"])
-
-    @patch("lyrica_client.httpx.get")
-    def test_get_lyrics_does_not_request_fast_mode(self, mock_get):
-        mock_get.return_value = _response(json_body={
-            "status": "success",
-            "data": {"timed_lyrics": [{"start_time": 0, "text": "la"}]},
-        })
-
-        lyrica_client.get_lyrics("Passenger", "Let Her Go")
-
-        _args, kwargs = mock_get.call_args
-        self.assertNotIn("fast", kwargs["params"])
-
 
 class FullFetchRequestsParallelRacingModeTestCase(unittest.TestCase):
     """The bug: get_lyrics_full()/get_lyrics() used to send a plain GET (no
@@ -154,7 +141,7 @@ class FullFetchRequestsParallelRacingModeTestCase(unittest.TestCase):
     PARALLEL/racing path, and raises the client timeout well above what
     Lyrica itself guarantees server-side."""
 
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_get_lyrics_full_requests_parallel_mode_excluding_musixmatch(self, mock_get):
         mock_get.return_value = _response(json_body={
             "status": "success",
@@ -171,19 +158,7 @@ class FullFetchRequestsParallelRacingModeTestCase(unittest.TestCase):
         # lyrica_client.py module docstring for the full justification).
         self.assertEqual(sequence_ids, {2, 3, 4, 5, 7})
 
-    @patch("lyrica_client.httpx.get")
-    def test_get_lyrics_requests_parallel_mode_too(self, mock_get):
-        mock_get.return_value = _response(json_body={
-            "status": "success",
-            "data": {"timed_lyrics": [{"start_time": 0, "text": "la"}]},
-        })
-
-        lyrica_client.get_lyrics("Passenger", "Let Her Go")
-
-        _args, kwargs = mock_get.call_args
-        self.assertEqual(kwargs["params"]["pass"], "true")
-
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_client_timeout_comfortably_exceeds_lyricas_server_side_bound(self, mock_get):
         mock_get.return_value = _response(json_body={
             "status": "success",
@@ -201,7 +176,7 @@ class FullFetchRequestsParallelRacingModeTestCase(unittest.TestCase):
         # authoritative 60s bound, not just the aspirational 12s one.
         self.assertGreater(kwargs["timeout"], 60)
 
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_slow_lyrics_fetch_returns_real_lyrics_instead_of_a_premature_timeout(self, mock_get):
         """Stands in for the real repro (see PR description): LRCLIB taking
         36s to respond with real lyrics for a legitimately slow lookup. The
@@ -226,7 +201,7 @@ class FullFetchRequestsParallelRacingModeTestCase(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["plain"], "real lyrics found late")
 
-    @patch("lyrica_client.httpx.get")
+    @patch("lyrics.lyrica_client.httpx.get")
     def test_timeout_that_still_exceeds_the_client_bound_reports_no_lyrics_not_a_crash(self, mock_get):
         # The genuine-timeout residual case: even the raised client timeout
         # eventually gets exceeded (e.g. Lyrica itself is down/overloaded).

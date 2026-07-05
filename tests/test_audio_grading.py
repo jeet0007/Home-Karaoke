@@ -6,7 +6,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import audio_grading as ag  # noqa: E402
+from core import audio_grading as ag  # noqa: E402
 
 SAMPLE_RATE = 44100
 
@@ -154,6 +154,107 @@ class RealtimeGraderTestCase(unittest.TestCase):
         # Should decay monotonically toward zero, not snap instantly.
         scores = [u["score"] for u in silence_updates]
         self.assertEqual(scores, sorted(scores, reverse=True))
+
+
+class ParseMelodyTestCase(unittest.TestCase):
+    def test_valid_notes_sorted(self):
+        raw = [
+            {"start_ms": 1000, "end_ms": 2000, "midi": 60},
+            {"start_ms": 0, "end_ms": 900, "midi": 57},
+        ]
+        notes = ag.parse_melody(raw)
+        self.assertEqual([n["midi"] for n in notes], [57.0, 60.0])
+
+    def test_garbage_entries_dropped(self):
+        raw = [
+            "not a dict",
+            {"start_ms": "x", "end_ms": 100, "midi": 60},
+            {"start_ms": 500, "end_ms": 100, "midi": 60},  # inverted
+            {"start_ms": -5, "end_ms": 100, "midi": 60},  # negative start
+            {"start_ms": 0, "end_ms": 100, "midi": float("nan")},
+            {"start_ms": 0, "end_ms": 100, "midi": 60},  # the one keeper
+        ]
+        notes = ag.parse_melody(raw)
+        self.assertEqual(len(notes), 1)
+
+    def test_non_list_or_empty_returns_none(self):
+        self.assertIsNone(ag.parse_melody(None))
+        self.assertIsNone(ag.parse_melody({"start_ms": 0}))
+        self.assertIsNone(ag.parse_melody([]))
+        self.assertIsNone(ag.parse_melody(["junk"]))
+
+
+class OctaveFoldingTestCase(unittest.TestCase):
+    def test_exact_and_octave_matches_are_zero(self):
+        self.assertAlmostEqual(ag._octave_folded_cents_off(69, 69), 0.0)
+        self.assertAlmostEqual(ag._octave_folded_cents_off(57, 69), 0.0)
+        self.assertAlmostEqual(ag._octave_folded_cents_off(81, 69), 0.0)
+
+    def test_semitone_off_is_100_cents_either_direction(self):
+        self.assertAlmostEqual(ag._octave_folded_cents_off(70, 69), 100.0)
+        self.assertAlmostEqual(ag._octave_folded_cents_off(68, 69), 100.0)
+        # ...even across an octave.
+        self.assertAlmostEqual(ag._octave_folded_cents_off(58, 69), 100.0)
+
+    def test_tritone_is_the_worst_case(self):
+        self.assertAlmostEqual(ag._octave_folded_cents_off(63, 69), 600.0)
+
+
+MELODY_A3 = [{"start_ms": 0.0, "end_ms": 60000.0, "midi": 57.0}]
+
+
+def _reference_grader(melody=MELODY_A3):
+    grader = ag.RealtimeGrader(SAMPLE_RATE, melody=melody)
+    grader.set_position(0)
+    return grader
+
+
+class ReferenceMelodyGradingTestCase(unittest.TestCase):
+    def test_on_pitch_singing_scores_high(self):
+        grader = _reference_grader()
+        updates = _feed_in_chunks(grader, _sine(220.0, seconds=2.5))  # A3, dead-on
+        self.assertGreaterEqual(updates[-1]["score"], 85)
+        self.assertEqual(updates[-1]["target_midi"], 57.0)
+
+    def test_octave_up_counts_as_on_pitch(self):
+        grader = _reference_grader()
+        updates = _feed_in_chunks(grader, _sine(440.0, seconds=2.5))  # A4 vs A3 target
+        self.assertGreaterEqual(updates[-1]["score"], 85)
+
+    def test_wrong_note_scores_much_lower_than_right_note(self):
+        right = _feed_in_chunks(_reference_grader(), _sine(220.0, seconds=2.5))
+        # E4 (330 Hz) is a tritone-ish 7 semitones up from A3 -> folded 500c off.
+        wrong = _feed_in_chunks(_reference_grader(), _sine(311.1, seconds=2.5))  # D#4: folded 600c
+        self.assertGreater(right[-1]["score"], wrong[-1]["score"] + 40)
+
+    def test_no_position_sync_falls_back_to_stability_grading(self):
+        grader = ag.RealtimeGrader(SAMPLE_RATE, melody=MELODY_A3)  # no set_position
+        updates = _feed_in_chunks(grader, _sine(311.1, seconds=2.5))  # "wrong" note
+        # Without a sync there is no song position, so the wrong-but-steady
+        # note grades on stability alone and still scores well.
+        self.assertGreaterEqual(updates[-1]["score"], 85)
+        self.assertIsNone(updates[-1]["target_midi"])
+
+    def test_instrumental_gap_falls_back_to_stability(self):
+        melody = [{"start_ms": 30000.0, "end_ms": 60000.0, "midi": 57.0}]
+        grader = _reference_grader(melody)  # position 0: no active note
+        updates = _feed_in_chunks(grader, _sine(311.1, seconds=2.5))
+        self.assertGreaterEqual(updates[-1]["score"], 85)
+        self.assertIsNone(updates[-1]["target_midi"])
+
+    def test_set_position_maps_song_time(self):
+        melody = [{"start_ms": 30000.0, "end_ms": 60000.0, "midi": 57.0}]
+        grader = ag.RealtimeGrader(SAMPLE_RATE, melody=melody)
+        grader.set_position(30500)  # jump into the note despite mic t=0
+        updates = _feed_in_chunks(grader, _sine(220.0, seconds=2.0))
+        self.assertEqual(updates[-1]["target_midi"], 57.0)
+        self.assertGreaterEqual(updates[-1]["score"], 85)
+
+    def test_non_finite_position_is_ignored(self):
+        grader = ag.RealtimeGrader(SAMPLE_RATE, melody=MELODY_A3)
+        grader.set_position(float("nan"))
+        updates = _feed_in_chunks(grader, _sine(220.0, seconds=1.0))
+        self.assertIsNone(updates[-1]["target_midi"])
 
 
 if __name__ == "__main__":

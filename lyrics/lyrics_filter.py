@@ -42,7 +42,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
-import lyrica_client
+from lyrics import lyrica_client
 
 DEFAULT_CHECK_CAP = 15
 DEFAULT_PER_CHECK_TIMEOUT = 6.0

@@ -1,0 +1,31 @@
+# Optional heavy-ML dependencies for the isolated-vocal note guide (Demucs
+# vocal separation -> Basic Pitch transcription; see vocal_transcribe.py)
+# plus tempo/BPM estimation (librosa; see tempo.py). NOT installed by
+# default: they pull in torch and are CPU-heavy. Without them there is NO
+# note guide (there is deliberately no low-quality full-mix fallback) and no
+# BPM - the song still plays with lyrics and live scoring, and the player
+# shows "no note guide available for this song".
+#
+#   pip install -r requirements-ml.txt
+#
+# On Linux, basic-pitch installs the TensorFlow Lite runtime (not full
+# TensorFlow); demucs pulls in torch/torchaudio. Expect a few minutes of CPU
+# per song for separation - this runs only in the background library queue,
+# never in a request, so it never blocks playback.
+#
+# On Apple Silicon (M1/M2/...), Basic Pitch only supports Python 3.10 - run
+# this app under a 3.10 venv on Mac, otherwise the note guide stays disabled.
+#
+# PyPI's demucs>=4.0 release (4.0.1) predates the demucs.api module this app
+# uses (vocal_transcribe.py) - it only exists on GitHub main, so install from
+# there instead of PyPI.
+
+git+https://github.com/facebookresearch/demucs#egg=demucs
+basic-pitch>=0.4
+# Tempo/BPM estimation. librosa also depends on numpy<2.1 (via numba), so it
+# coexists with the pin below; it reads the decoded mix.wav via soundfile.
+librosa>=0.10
+# demucs pins torchaudio<2.1, which pulls an old torch built against NumPy
+# 1.x - keep NumPy on the 1.x line too, or torch/torchaudio import with an
+# ABI-mismatch warning that can crash at runtime.
+numpy<2
