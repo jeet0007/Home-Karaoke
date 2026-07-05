@@ -7,3 +7,5 @@ library.db*
 data/
 .venv*
 .DS_Store
+.mcp.json
+.claude
