@@ -180,7 +180,10 @@ class UnifiedSearchRouteTestCase(unittest.TestCase):
     def test_home_page_renders(self):
         resp = self.client.get("/")
         self.assertEqual(resp.status_code, 200)
-        self.assertIn(b"/unified-search", resp.data)
+        # The search wiring itself now lives in static/index/search.js, not
+        # inlined in the template - this just confirms the page loads it as
+        # a module.
+        self.assertIn(b'<script type="module" src="/static/index/main.js">', resp.data)
 
 
 if __name__ == "__main__":

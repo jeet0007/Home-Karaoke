@@ -17,17 +17,17 @@ class PlayerRouteTestCase(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 200)
         html = resp.get_data(as_text=True)
-        # player.html's loadSong() fetches /select-song using these exact
-        # template vars, so whatever identity /player is called with is what
-        # /select-song ends up queried with.
-        self.assertIn('const songTitle = "Let Her Go"', html)
-        self.assertIn('const artist = "Passenger"', html)
-        self.assertIn('const durationHint = "253"', html)
+        # static/player/main.js's loadSong() fetches /select-song using
+        # window.PLAYER_CONFIG's exact fields, so whatever identity /player
+        # is called with is what /select-song ends up queried with.
+        self.assertIn('title: "Let Her Go"', html)
+        self.assertIn('artist: "Passenger"', html)
+        self.assertIn('duration: "253"', html)
 
     def test_player_forwards_ytmusic_video_id_for_melody_extraction(self):
         resp = self.client.get("/player?title=X&artist=Y&ytm=abc12345678")
         html = resp.get_data(as_text=True)
-        self.assertIn('const ytmusicVideoId = "abc12345678"', html)
+        self.assertIn('ytmusicVideoId: "abc12345678"', html)
 
 
 if __name__ == "__main__":
