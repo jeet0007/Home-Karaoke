@@ -21,7 +21,8 @@ import {
   drawNoteGuide,
 } from './note-guide.js';
 import { ensureGradingStarted, stopGrading, sendPositionSync } from './grading.js';
-import { enableControls, setPlayButton, togglePlayback, restartPlayback, changeVolume, loadStream } from './playback.js';
+import { enableControls, setPlayButton, togglePlayback, restartPlayback, loadStream } from './playback.js';
+import { setupSingerAssist } from './singer-assist.js';
 
 const { title: songTitle, artist, duration: durationHint, ytmusicVideoId } = window.PLAYER_CONFIG;
 
@@ -30,8 +31,6 @@ const artBackgroundImg = document.getElementById('art-background-img');
 const audio = document.getElementById('audio');
 const playPauseBtn = document.getElementById('play-pause');
 const restartBtn = document.getElementById('restart');
-const volumeDownBtn = document.getElementById('volume-down');
-const volumeUpBtn = document.getElementById('volume-up');
 const syncEarlierBtn = document.getElementById('sync-earlier');
 const syncLaterBtn = document.getElementById('sync-later');
 
@@ -104,6 +103,7 @@ async function loadSong() {
       pollForMelody(artist, songTitle);
     }
     setBpm(data.bpm);
+    setupSingerAssist(data.song_id, Boolean(data.has_singer_vocals));
 
     const syncedLines = (data.lyrics && data.lyrics.synced) || [];
     renderLyrics(syncedLines);
@@ -128,8 +128,6 @@ async function loadSong() {
 
 playPauseBtn.addEventListener('click', togglePlayback);
 restartBtn.addEventListener('click', restartPlayback);
-volumeDownBtn.addEventListener('click', () => changeVolume(-0.1));
-volumeUpBtn.addEventListener('click', () => changeVolume(0.1));
 syncEarlierBtn.addEventListener('click', () => handleSyncAdjust(-SYNC_STEP_MS));
 syncLaterBtn.addEventListener('click', () => handleSyncAdjust(SYNC_STEP_MS));
 
@@ -153,12 +151,6 @@ document.addEventListener('keydown', (e) => {
     togglePlayback();
   } else if (e.key.toLowerCase() === 'r') {
     restartPlayback();
-  } else if (e.key === 'ArrowUp') {
-    e.preventDefault();
-    changeVolume(0.1);
-  } else if (e.key === 'ArrowDown') {
-    e.preventDefault();
-    changeVolume(-0.1);
   } else if (e.key === '[') {
     e.preventDefault();
     handleSyncAdjust(-SYNC_STEP_MS);

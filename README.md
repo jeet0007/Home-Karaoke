@@ -132,9 +132,10 @@ The melody comes **only** from the isolated vocal: `vocal_transcribe.py` runs
 [Demucs](https://github.com/adefossez/demucs) vocal separation, then
 [Basic Pitch](https://github.com/spotify/basic-pitch) transcription on the isolated vocal — clean
 monophonic vocal MIDI with none of the bass/instrument confusion. It's an **opt-in add-on**:
-`pip install -r requirements-ml.txt` (pulls in torch; on Linux Basic Pitch uses the lightweight
-TensorFlow Lite runtime). Expect a few minutes of CPU per song — it runs only in the background
-queue, so it never blocks playback.
+`python scripts/bootstrap_ml.py` (detects your OS/CPU/Python version and installs
+`requirements-ml.txt` plus the platform-specific extra basic-pitch needs — pulls in torch; on Linux
+Basic Pitch uses the lightweight TensorFlow Lite runtime). Expect a few minutes of CPU per song — it
+runs only in the background queue, so it never blocks playback.
 
 There is deliberately **no full-mix fallback**. Transcribing the dominant pitch of a full mix tracks
 the bass/accompaniment as often as the vocal, so a wrong guide is worse than none — without the ML
