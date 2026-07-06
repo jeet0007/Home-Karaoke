@@ -6,7 +6,14 @@
 # BPM - the song still plays with lyrics and live scoring, and the player
 # shows "no note guide available for this song".
 #
-#   pip install -r requirements-ml.txt
+#   python scripts/bootstrap_ml.py
+#
+# ^ detects your OS/CPU/Python version and installs this file plus the
+# platform-specific extra(s) basic-pitch needs on your machine (e.g. a
+# scikit-learn pin on Apple Silicon, tflite-runtime elsewhere) - avoids
+# manually chasing backend-mismatch warnings per device. A plain
+# `pip install -r requirements-ml.txt` still works, it just leaves those
+# extras for you to sort out by hand.
 #
 # On Linux, basic-pitch installs the TensorFlow Lite runtime (not full
 # TensorFlow); demucs pulls in torch/torchaudio. Expect a few minutes of CPU
