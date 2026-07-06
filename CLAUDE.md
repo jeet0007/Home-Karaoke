@@ -6,7 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 pip install -r requirements.txt          # core deps
-pip install -r requirements-ml.txt       # optional: Demucs + Basic Pitch for accurate melody extraction
+python scripts/bootstrap_ml.py           # optional: Demucs + Basic Pitch for accurate melody extraction
+# ^ detects OS/CPU/Python version and installs requirements-ml.txt plus the
+# platform-specific extra basic-pitch needs (e.g. a scikit-learn pin on Apple
+# Silicon, tflite-runtime elsewhere) - avoids chasing backend-mismatch
+# warnings by hand. `pip install -r requirements-ml.txt` still works, it just
+# leaves those extras for you to sort out.
 # ^ on Apple Silicon: Basic Pitch only supports Python 3.10, so create that
 # venv first, e.g. `pyenv install 3.10.20 && ~/.pyenv/versions/3.10.20/bin/python3.10 -m venv .venv-ml`
 
@@ -30,8 +35,9 @@ The code is split along one line: a **core "music → MIDI" pipeline** (`core/`)
 app.py            Flask entry point: HTTP/WebSocket routes + wiring
 core/             the "music -> MIDI" engine + persistence (no web deps)
   pipeline.py       per-song stage orchestration (resumable; each stage skips if its artifact exists)
-  library.py        SQLite song library + background processing queue (SongLibrary, LibraryWorker)
-  artifacts.py      on-disk store for reusable per-song files (KARAOKE_DATA_DIR, default ./data/<song_id>/)
+  library.py        SQLite song library + background processing queue (SongLibrary, LibraryWorker) + append-only stage_runs lineage
+  artifacts.py      on-disk store for reusable per-song files (KARAOKE_DATA_DIR, default ./data/<song_id>/) + sha256 content_hash()
+  logging_config.py structured JSON logging (lazy/idempotent; KARAOKE_LOG_DIR, default ./logs/pipeline.log)
   vocal_transcribe.py  Demucs -> Basic Pitch vocal transcription — the ONLY melody source, opt-in via requirements-ml.txt
   midi.py           dependency-free Standard MIDI File writer
   audio.py          shared ffmpeg audio-decode helper
@@ -47,7 +53,8 @@ lyrics/           multi-source lyrics
   lyrics_sources.py Lyrica-first / LRCLIB-fallback ordering
   lyrics_filter.py  pre-selection lyrics-availability filtering
 wasm/grading/     Rust port of core/audio_grading.py's YIN pitch detector + RealtimeGrader, compiled to WASM (dev-time-only Rust dep; compiled output is checked into static/player/wasm/, see wasm/grading/README.md)
-templates/ static/  the vanilla-JS player + search GUI (static/player/grading.js runs live grading client-side via the WASM module inside static/grading-worklet.js, an AudioWorklet, falling back to the /grade WebSocket only if WebAssembly is unavailable)
+templates/ static/  the vanilla-JS player + search GUI (static/player/grading.js runs live grading client-side via the WASM module inside static/grading-worklet.js, an AudioWorklet, falling back to the /grade WebSocket only if WebAssembly is unavailable; static/player/singer-assist.js toggles the isolated vocal stem in as a guide track)
+scripts/bootstrap_ml.py  detects OS/CPU/Python version and installs requirements-ml.txt + the right platform-specific extra
 tests/            unittest suite (mirrors the modules above)
 ```
 
@@ -69,6 +76,12 @@ Artifact paths are tracked in the library DB (`artifacts` table). `mix.wav`/`voc
 
 Songs picked in the player are queued into a SQLite library (`library.db`, relocatable via `LIBRARY_DB`). A single `LibraryWorker` thread drains the queue one song at a time (deliberately single-threaded — each song fans out yt-dlp/ffmpeg/Demucs subprocesses, and the target host is a small NAS) and runs the core pipeline. The queue *is* the songs table — a `status` column walks `pending → processing → ready/failed`, so it survives restarts.
 
+### Pipeline lineage & structured logging
+
+Each processing run gets a `run_id` (generated in `LibraryWorker._process_one`); every stage's outcome is both folded into the overwritten-each-run `songs.report_json` (for the UI) *and* appended as its own row to `stage_runs` (song_id, run_id, stage, status, started_at/finished_at, duration_ms, input/output sha256 hashes via `ArtifactStore.content_hash()`, error/detail) — an append-only table, so history survives reprocessing instead of being clobbered. `SongLibrary.list_stage_runs(song_id)` / `list_stage_runs_for_run(run_id)` read it back. `pipeline.py` stays DB-agnostic (no `SongLibrary` import) — it returns `stage_runs` on its result dict (or on a raised `ProcessingError`), and the worker is the sole persistence point. Deliberately no full orchestrator (Dagster/Prefect evaluated and rejected — both want a persistent daemon + metadata DB, which fights the one-thread/one-.db-file/no-broker NAS-footprint stance above) and no declarative stage-descriptor refactor (flagged as a clean follow-up, not done — today's `_stage_*` functions are still ad hoc/non-uniform).
+
+Structured JSON logs (`song_id`/`run_id`/`stage`/`status`/`duration_ms`) go to `KARAOKE_LOG_DIR/pipeline.log` (default `./logs/`, rotating). `core/logging_config.configure()` is lazy/idempotent and only called from `app.py`'s `start_library_worker()` — importing `core.pipeline` never creates the log directory as a side effect (matters for the test suite).
+
 ### Melody extraction — isolated-vocal only, no fallback
 
 `vocal_transcribe.py` — Demucs vocal separation then Basic Pitch transcription on the isolated vocal — is the ONLY melody source. Requires `requirements-ml.txt` (pulls in torch); opt-in and best-effort. There is deliberately no full-mix pitch-tracking fallback: transcribing the dominant pitch of a full mix tracks the bass/accompaniment as often as the vocal, and a wrong note guide is worse than none. When the ML deps aren't installed, `ytmusic_video_id` is missing, or transcription fails, `_stage_melody` (`core/pipeline.py`) returns `None` — the song stays playable with lyrics and live scoring, just no note guide. Every outcome is recorded per-song in the pipeline's `report` dict (ok/reused/skipped/failed + detail).
@@ -87,11 +100,15 @@ Lyrica sidecar (races LRCLIB, YouTube, NetEase, Megalobiz, SimpMusic internally)
 
 Melody extraction additionally requires `ffmpeg` on `PATH` (not vendored) — without it the note guide is silently skipped, playback/lyrics unaffected.
 
+### Singer assist
+
+The player can toggle the isolated vocal stem (`artifacts.KIND_VOCALS`, the same file the melody stage already produces) in as an adjustable-volume guide track, via `GET /library/song/<id>/vocals` and `static/player/singer-assist.js`. Best-effort like the note guide: the toggle button stays hidden for songs with no processed stem (no ML add-on, or not processed yet). No on-screen master-volume control — this targets a TV (remote) or device with its own hardware/OS volume, so that would be redundant; the singer-assist slider is a distinct *mix* control (how much original vocal to blend in), not overall loudness.
+
 ## Endpoints (see README.md for full request/response shapes)
 
 ```
-GET  /library, POST /library/add, GET /library/song/<id>, GET /library/song/<id>/midi, POST /library/seed-charts
+GET  /library, POST /library/add, GET /library/song/<id>, GET /library/song/<id>/midi, GET /library/song/<id>/vocals, POST /library/seed-charts
 GET  /lyrics?artist=&title=&duration=
 GET  /metadata?artist=&title=
-/grade    WebSocket — live pitch/melody grading against the stored melody (octave-folded)
+/grade    WebSocket — final fallback tier only; primary live grading runs client-side via wasm/grading/ inside an AudioWorklet
 ```

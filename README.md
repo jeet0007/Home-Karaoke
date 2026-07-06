@@ -30,12 +30,13 @@ is already in use, set `APP_PORT=<other port>` and retry, or free port 5000 in S
 app.py            Flask entry point: HTTP/WebSocket routes + wiring
 core/             the "music -> MIDI" engine + persistence (no web deps)
   pipeline.py       per-song stage orchestration (resumable)
-  library.py        SQLite song library + processing queue
-  artifacts.py      on-disk store for reusable per-song files
+  library.py        SQLite song library + processing queue + append-only stage_runs lineage
+  artifacts.py      on-disk store for reusable per-song files + sha256 content hashing
+  logging_config.py structured JSON logging (KARAOKE_LOG_DIR, default ./logs/)
   vocal_transcribe.py  Demucs -> Basic Pitch vocal transcription (the melody source)
   tempo.py          librosa tempo/BPM estimation from the decoded mix
   midi.py           dependency-free Standard MIDI File writer
-  audio_grading.py  live pitch/melody scoring (the /grade WebSocket)
+  audio_grading.py  live pitch/melody scoring - reference implementation + final fallback tier for /grade
 search/           finding songs + backing videos
   song_search.py    ytmusicapi song-identity search + charts
   karaoke_search.py yt-dlp karaoke-video ranking
@@ -46,7 +47,12 @@ lyrics/           multi-source lyrics
   lrclib_client.py  direct LRCLIB API client (fallback)
   lyrics_sources.py Lyrica-first / LRCLIB-fallback ordering
   lyrics_filter.py  pre-selection lyrics-availability filtering
-templates/ static/  the vanilla-JS player + search GUI
+wasm/grading/     Rust port of the YIN pitch detector, compiled to WASM (dev-time-only Rust dep;
+                  compiled output is checked into static/player/wasm/, see wasm/grading/README.md)
+templates/ static/  the vanilla-JS player + search GUI - live grading runs client-side via the WASM
+                  module in an AudioWorklet, falling back to the /grade WebSocket only if
+                  WebAssembly is unavailable
+scripts/bootstrap_ml.py  detects OS/CPU/Python version, installs requirements-ml.txt + the right extra
 tests/            unittest suite (mirrors the modules above)
 ```
 
@@ -59,8 +65,11 @@ artifacts, and a **presentation layer** (the player page + live scorer) that onl
   isolated vocal stem, and a reference melody (note segments **and** a real `.mid` file) — persisting
   each to disk via `core/artifacts.py`. It has no idea a web player exists; it could be driven from a
   CLI or cron just as well.
-- **Presentation** (`templates/player.html`, `core/audio_grading.py`): reads the stored melody/lyrics
-  to draw the note guide and score singing. It never *produces* an artifact.
+- **Presentation** (`templates/player.html`, `wasm/grading/`, `core/audio_grading.py`): reads the
+  stored melody/lyrics to draw the note guide and score singing — primarily client-side via the
+  Rust/WASM port running in an AudioWorklet, falling back to `core/audio_grading.py`'s original
+  server-side scorer (the `/grade` WebSocket) only if WebAssembly is unavailable. Presentation never
+  *produces* an artifact.
 
 ### Artifacts (reusable intermediates)
 
@@ -95,6 +104,7 @@ GET  /library                → all stored songs with queue status (?status=rea
 POST /library/add            → {"artist", "title", "duration_seconds"?, "ytmusic_video_id"?} — enqueue
 GET  /library/song/<id>      → full stored payload (lyrics/melody + artifact paths + processing report)
 GET  /library/song/<id>/midi → download the transcribed melody as a Standard MIDI File
+GET  /library/song/<id>/vocals → stream the isolated vocal stem for the singer-assist toggle
 POST /library/seed-charts    → {"limit": 20, "country": "ZZ"} — enqueue the current YouTube Music top
                                charts so the library builds itself over time (run occasionally/cron)
 ```
@@ -119,6 +129,10 @@ on the search page renders these as per-stage badges (✓ lyrics · – guide ·
 you see what passed, what was skipped, and what failed. Failed songs still carry their one-line
 `error`; the report adds the granularity for the best-effort stages (the note guide) that otherwise
 leave no trace.
+
+Every stage run is also appended to a `stage_runs` lineage table (survives reprocessing, unlike the
+report above which is overwritten each run) and logged as structured JSON to `KARAOKE_LOG_DIR`
+(default `./logs/`) — see CLAUDE.md for the schema.
 
 ## Note guide & melody scoring
 
@@ -148,6 +162,16 @@ the guide.
 is stored, written into the exported `.mid` as its real tempo (instead of a nominal 120), reported
 per song, and shown as a chip on the player. Best-effort: if librosa isn't installed or estimation
 fails, the song simply carries no BPM.
+
+### Singer assist
+
+The player can toggle the isolated vocal stem — the same `vocals.wav` the melody stage already
+produces — in as an adjustable-volume guide track alongside the backing video's audio
+(`GET /library/song/<id>/vocals`, `static/player/singer-assist.js`). The toggle button only appears
+for songs with a processed stem; its volume slider only shows while the toggle is on. This is a
+*mix* control (how much of the original vocal to blend in as a guide), separate from overall
+loudness — there's no on-screen master-volume control, since this targets a TV (remote) or device
+that already has its own hardware/OS volume.
 
 ### Lyric sync offset
 
