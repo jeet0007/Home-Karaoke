@@ -781,6 +781,12 @@ def grade(ws):
     reference vocal to compare against, so this is not melody-accuracy
     grading against the original song).
 
+    This is now the *final fallback* tier of static/player/grading.js's
+    grading backend ladder - the primary path runs the same scoring
+    client-side via a Rust/WASM port (wasm/grading/) inside an
+    AudioWorklet, with no network round trip. This route only sees
+    traffic when a browser can't load/run WebAssembly at all.
+
     Protocol: the client's first message must be a JSON text frame
     {"sample_rate": <int>} matching the AudioContext sample rate it
     captured at; it may also carry "melody" (reference note segments from

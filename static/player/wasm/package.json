@@ -1,0 +1,16 @@
+{
+  "name": "karaoke-grading-wasm",
+  "type": "module",
+  "description": "Client-side port of core/audio_grading.py's YIN pitch detector + RealtimeGrader scoring, compiled to WASM for static/grading-worklet.js. See README.md for the build command.",
+  "version": "0.1.0",
+  "files": [
+    "grading_wasm_bg.wasm",
+    "grading_wasm.js",
+    "grading_wasm.d.ts"
+  ],
+  "main": "grading_wasm.js",
+  "types": "grading_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
