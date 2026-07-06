@@ -19,6 +19,7 @@ from simple_websocket import ConnectionClosed
 
 from core import artifacts
 from core import library
+from core import logging_config
 from core import pipeline
 from core.audio_grading import RealtimeGrader, parse_melody
 from lyrics import lyrica_client
@@ -229,6 +230,7 @@ def start_library_worker():
     (never on import, so tests and WSGI tooling don't spawn threads), and
     only in the Werkzeug reloader's serving child - the parent process
     never handles requests and must not compete for queue jobs."""
+    logging_config.configure()
     process = pipeline.build_processor(
         artifact_store,
         fetch_lyrics=_library_fetch_lyrics,

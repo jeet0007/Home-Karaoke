@@ -241,6 +241,96 @@ class ArtifactRecordingTestCase(unittest.TestCase):
         self.assertIsNone(self.lib.get_artifact(song["id"], "midi"))
 
 
+STAGE_RUNS = [
+    {
+        "stage": "lyrics",
+        "status": "ok",
+        "started_at": 1000.0,
+        "finished_at": 1000.2,
+        "duration_ms": 200,
+        "input_hashes": None,
+        "output_path": "/data/1/lyrics.json",
+        "output_hash": "abc123",
+        "error": None,
+        "detail": "1 synced lines from lrclib",
+    },
+    {
+        "stage": "tempo",
+        "status": "failed",
+        "started_at": 1000.2,
+        "finished_at": 1000.3,
+        "duration_ms": 100,
+        "input_hashes": ["deadbeef"],
+        "output_path": None,
+        "output_hash": None,
+        "error": "tempo estimation failed: boom",
+        "detail": "tempo estimation failed: boom",
+    },
+]
+
+
+class StageRunsTestCase(unittest.TestCase):
+    def setUp(self):
+        self.lib = _temp_library(self)
+
+    def test_round_trips_stage_runs(self):
+        song = self.lib.enqueue("Passenger", "Let Her Go")
+        self.lib.record_stage_runs(song["id"], "run-1", STAGE_RUNS)
+
+        rows = self.lib.list_stage_runs(song["id"])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["stage"], "lyrics")
+        self.assertEqual(rows[0]["output_hash"], "abc123")
+        self.assertIsNone(rows[0]["input_hashes"])
+        # input_hashes round-trips through the input_hashes_json column.
+        self.assertEqual(rows[1]["input_hashes"], ["deadbeef"])
+        self.assertEqual(rows[1]["status"], "failed")
+
+    def test_list_stage_runs_for_run_filters_by_run_id(self):
+        song = self.lib.enqueue("Passenger", "Let Her Go")
+        self.lib.record_stage_runs(song["id"], "run-1", STAGE_RUNS[:1])
+        self.lib.record_stage_runs(song["id"], "run-2", STAGE_RUNS[1:])
+
+        self.assertEqual(len(self.lib.list_stage_runs_for_run("run-1")), 1)
+        self.assertEqual(len(self.lib.list_stage_runs_for_run("run-2")), 1)
+        # Both runs' rows accumulate against the same song (append-only -
+        # (song_id, stage) legitimately repeats across reprocessing runs).
+        self.assertEqual(len(self.lib.list_stage_runs(song["id"])), 2)
+
+    def test_empty_list_is_a_no_op(self):
+        song = self.lib.enqueue("Passenger", "Let Her Go")
+        self.lib.record_stage_runs(song["id"], "run-1", [])
+        self.assertEqual(self.lib.list_stage_runs(song["id"]), [])
+
+    def test_stage_runs_table_is_created_onto_an_older_db(self):
+        # Mirrors test_report_json_column_is_migrated_onto_an_older_db: a
+        # pre-stage_runs DB gains the table on open, with no backfill (an
+        # existing ready song has no stage_runs rows retroactively created).
+        import sqlite3
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = os.path.join(tmp.name, "old.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE songs (id INTEGER PRIMARY KEY AUTOINCREMENT, artist TEXT NOT NULL, title TEXT NOT NULL,"
+            " album TEXT, duration_seconds INTEGER, cover_art TEXT NOT NULL DEFAULT '', ytmusic_video_id TEXT,"
+            " status TEXT NOT NULL DEFAULT 'pending', error TEXT, video_id TEXT, lyrics_json TEXT, melody_json TEXT,"
+            " created_at REAL NOT NULL, updated_at REAL NOT NULL, UNIQUE(artist, title))"
+        )
+        conn.execute(
+            "INSERT INTO songs (artist, title, status, created_at, updated_at) VALUES ('A','B','ready',0,0)"
+        )
+        conn.commit()
+        conn.close()
+
+        lib = library.SongLibrary(db_path)
+        with lib._db() as c:
+            tables = {r["name"] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertIn("stage_runs", tables)
+        self.assertEqual(lib.list_stage_runs(1), [])
+
+
 class LibraryWorkerTestCase(unittest.TestCase):
     def setUp(self):
         self.lib = _temp_library(self)
@@ -260,7 +350,7 @@ class LibraryWorkerTestCase(unittest.TestCase):
     def test_worker_processes_queue_to_ready(self):
         song = self.lib.enqueue("Passenger", "Let Her Go")
 
-        def process(_song):
+        def process(_song, run_id=None):
             return {"video_id": "vid123", "lyrics": LYRICS, "melody": None, "artifacts": ARTIFACTS}
 
         self._run_worker_until(
@@ -274,7 +364,7 @@ class LibraryWorkerTestCase(unittest.TestCase):
     def test_worker_marks_processing_error_as_failed_with_message(self):
         song = self.lib.enqueue("Obscure", "B-side")
 
-        def process(_song):
+        def process(_song, run_id=None):
             raise library.ProcessingError("no synced lyrics found in any source")
 
         self._run_worker_until(
@@ -286,7 +376,7 @@ class LibraryWorkerTestCase(unittest.TestCase):
         bad = self.lib.enqueue("Artist", "Crashy")
         good = self.lib.enqueue("Artist", "Fine")
 
-        def process(song):
+        def process(song, run_id=None):
             if song["title"] == "Crashy":
                 raise RuntimeError("boom")
             return {"video_id": "vid123", "lyrics": LYRICS, "melody": None}
@@ -297,6 +387,69 @@ class LibraryWorkerTestCase(unittest.TestCase):
         failed = self.lib.get(bad["id"])
         self.assertEqual(failed["status"], library.STATUS_FAILED)
         self.assertIn("unexpected error", failed["error"])
+
+    def test_worker_generates_and_threads_a_run_id(self):
+        song = self.lib.enqueue("Passenger", "Let Her Go")
+        seen_run_ids = []
+
+        def process(_song, run_id=None):
+            seen_run_ids.append(run_id)
+            return {"video_id": "vid123", "lyrics": LYRICS, "melody": None}
+
+        self._run_worker_until(
+            process, lambda: self.lib.get(song["id"])["status"] == library.STATUS_READY
+        )
+        self.assertEqual(len(seen_run_ids), 1)
+        self.assertTrue(seen_run_ids[0])  # non-empty - LibraryWorker generated one
+
+    def test_worker_persists_stage_runs_on_success(self):
+        song = self.lib.enqueue("Passenger", "Let Her Go")
+        captured = {}
+
+        def process(_song, run_id=None):
+            captured["run_id"] = run_id
+            return {
+                "video_id": "vid123",
+                "lyrics": LYRICS,
+                "melody": None,
+                "artifacts": ARTIFACTS,
+                "stage_runs": [dict(STAGE_RUNS[0])],
+            }
+
+        self._run_worker_until(
+            process, lambda: self.lib.get(song["id"])["status"] == library.STATUS_READY
+        )
+        rows = self.lib.list_stage_runs(song["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["stage"], "lyrics")
+        self.assertEqual(self.lib.list_stage_runs_for_run(captured["run_id"]), rows)
+
+    def test_worker_persists_stage_runs_on_processing_error(self):
+        song = self.lib.enqueue("Obscure", "B-side")
+
+        def process(_song, run_id=None):
+            raise library.ProcessingError(
+                "no synced lyrics found in any source", stage_runs=[dict(STAGE_RUNS[1])]
+            )
+
+        self._run_worker_until(
+            process, lambda: self.lib.get(song["id"])["status"] == library.STATUS_FAILED
+        )
+        rows = self.lib.list_stage_runs(song["id"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["stage"], "tempo")
+        self.assertEqual(rows[0]["status"], "failed")
+
+    def test_worker_records_no_stage_runs_on_bare_crash(self):
+        song = self.lib.enqueue("Artist", "Crashy")
+
+        def process(_song, run_id=None):
+            raise RuntimeError("boom")
+
+        self._run_worker_until(
+            process, lambda: self.lib.get(song["id"])["status"] == library.STATUS_FAILED
+        )
+        self.assertEqual(self.lib.list_stage_runs(song["id"]), [])
 
 
 if __name__ == "__main__":

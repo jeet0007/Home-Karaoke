@@ -15,6 +15,7 @@ and serve them. Kept deliberately dumb (no DB, no network) so it imports
 cheaply and tests without either.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -69,6 +70,21 @@ class ArtifactStore:
     def size(self, song_id, kind):
         peek = self._peek_path(song_id, kind)
         return os.path.getsize(peek) if os.path.isfile(peek) else 0
+
+    def content_hash(self, song_id, kind, chunk_size=1 << 20):
+        """sha256 of the artifact's current on-disk bytes, or None if it
+        doesn't exist. Used for stage_runs lineage (library.py) so a run's
+        recorded input/output can be verified against what's actually on
+        disk - not a caching/change-detection mechanism, so a plain
+        streaming hash is enough."""
+        peek = self._peek_path(song_id, kind)
+        if not os.path.isfile(peek):
+            return None
+        digest = hashlib.sha256()
+        with open(peek, "rb") as handle:
+            for chunk in iter(lambda: handle.read(chunk_size), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def write_bytes(self, song_id, kind, data):
         target = self.path(song_id, kind)

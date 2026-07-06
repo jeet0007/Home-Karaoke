@@ -33,11 +33,22 @@ cheap; vocal_transcribe/tempo only pull in torch/librosa lazily, inside
 their functions, when actually used.
 """
 
+import logging
+import time
+import uuid
+
 from core import artifacts
 from core import midi
 from core import tempo
 from core import vocal_transcribe
 from core.library import ProcessingError
+
+# Module-level getLogger is a no-op until something calls
+# logging_config.configure() (app.py's start_library_worker() does, in
+# production) - this module deliberately does NOT import core.logging_config
+# or attach a handler itself, so importing core.pipeline (every pipeline
+# test does) stays a zero-side-effect operation: no logs/ dir, no handler.
+_logger = logging.getLogger("karaoke.pipeline")
 
 # Notes falling outside the sung sections of the song (intros, solos,
 # outros) are dropped - the synced lyrics tell us when someone is actually
@@ -73,60 +84,127 @@ def _record(produced, store, song_id, kind):
     produced.append({"kind": kind, "path": store.path(song_id, kind), "bytes": store.size(song_id, kind)})
 
 
-def _stage(report, name, status, detail):
+class RunContext:
+    """Mutable per-run state threaded through every pipeline stage - the
+    mechanical rename of the old bare `report` dict parameter into one
+    object that also carries stage_runs lineage, so every existing call site
+    that used to receive `report` stays a single parameter, not a widened
+    signature.
+
+    `report` is unchanged (still what songs.report_json stores). `stage_runs`
+    is new: one entry per _stage() call, with timing + content hashes, for
+    the stage_runs table (persisted by library.py - this module has no idea
+    that table exists)."""
+
+    __slots__ = ("run_id", "song_id", "report", "stage_runs")
+
+    def __init__(self, run_id, song_id):
+        self.run_id = run_id
+        self.song_id = song_id
+        self.report = {}
+        self.stage_runs = []
+
+
+def _stage(ctx, name, status, detail, *, started_at=None, input_hashes=None, output_path=None, output_hash=None):
     """Record one stage's outcome. status is ok/reused/skipped/failed; detail
-    is a short human-readable explanation of what passed / why it didn't."""
-    report[name] = {"status": status, "detail": detail}
+    is a short human-readable explanation of what passed / why it didn't.
+
+    Populates both ctx.report (unchanged shape/consumer) and ctx.stage_runs
+    (new: timing + content-hash lineage), and logs one line per call - INFO,
+    or ERROR when status is "failed"."""
+    finished_at = time.time()
+    started_at = finished_at if started_at is None else started_at
+    duration_ms = int(round((finished_at - started_at) * 1000))
+
+    ctx.report[name] = {"status": status, "detail": detail}
+    ctx.stage_runs.append(
+        {
+            "stage": name,
+            "status": status,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_ms": duration_ms,
+            "input_hashes": input_hashes,
+            "output_path": output_path,
+            "output_hash": output_hash,
+            "error": detail if status == "failed" else None,
+            "detail": detail,
+        }
+    )
+
+    _logger.log(
+        logging.ERROR if status == "failed" else logging.INFO,
+        "stage %s %s: %s",
+        name,
+        status,
+        detail,
+        extra={
+            "song_id": ctx.song_id,
+            "run_id": ctx.run_id,
+            "stage": name,
+            "status": status,
+            "duration_ms": duration_ms,
+        },
+    )
 
 
-def _stage_lyrics(song, store, produced, fetch_lyrics, report):
+def _stage_lyrics(song, store, produced, fetch_lyrics, ctx):
+    started_at = time.time()
     lyrics = fetch_lyrics(song["artist"], song["title"], song["duration_seconds"])
     if not lyrics or not lyrics.get("synced"):
-        _stage(report, "lyrics", "failed", "no synced lyrics found in any source")
-        raise ProcessingError("no synced lyrics found in any source", report=report)
+        _stage(ctx, "lyrics", "failed", "no synced lyrics found in any source", started_at=started_at)
+        raise ProcessingError("no synced lyrics found in any source", report=ctx.report, stage_runs=ctx.stage_runs)
     store.write_json(song["id"], artifacts.KIND_LYRICS, lyrics)
     _record(produced, store, song["id"], artifacts.KIND_LYRICS)
     _stage(
-        report,
+        ctx,
         "lyrics",
         "ok",
         f"{len(lyrics['synced'])} synced lines from {lyrics.get('source') or 'unknown source'}",
+        started_at=started_at,
+        output_path=store.path(song["id"], artifacts.KIND_LYRICS),
+        output_hash=store.content_hash(song["id"], artifacts.KIND_LYRICS),
     )
     return lyrics
 
 
-def _stage_video(song, find_video, report):
+def _stage_video(song, find_video, ctx):
+    started_at = time.time()
     video = find_video(song["artist"], song["title"], song["duration_seconds"])
     if not video or not video.get("video_id"):
-        _stage(report, "video", "failed", "no karaoke backing track found")
-        raise ProcessingError("no karaoke backing track found", report=report)
-    _stage(report, "video", "ok", f"picked backing video {video['video_id']}")
+        _stage(ctx, "video", "failed", "no karaoke backing track found", started_at=started_at)
+        raise ProcessingError("no karaoke backing track found", report=ctx.report, stage_runs=ctx.stage_runs)
+    _stage(ctx, "video", "ok", f"picked backing video {video['video_id']}", started_at=started_at)
     return video
 
 
-def _estimate_tempo(store, song_id, report):
+def _estimate_tempo(store, song_id, ctx):
     """Best-effort BPM of the decoded full mix (librosa; see tempo.py). The
     mix drives the beat, so tempo is estimated from it, not the vocal. Every
-    outcome is recorded in `report`; returns the BPM or None."""
+    outcome is recorded on ctx; returns the BPM or None."""
+    started_at = time.time()
     if not tempo.available():
-        _stage(report, "tempo", "skipped", "tempo add-on (librosa) not installed")
+        _stage(ctx, "tempo", "skipped", "tempo add-on (librosa) not installed", started_at=started_at)
         return None
     if not store.exists(song_id, artifacts.KIND_MIX):
-        _stage(report, "tempo", "skipped", "no decoded mix to analyze")
+        _stage(ctx, "tempo", "skipped", "no decoded mix to analyze", started_at=started_at)
         return None
+    input_hashes = [store.content_hash(song_id, artifacts.KIND_MIX)]
     try:
         bpm = tempo.estimate_bpm(store.path(song_id, artifacts.KIND_MIX))
     except Exception as exc:
-        _stage(report, "tempo", "failed", f"tempo estimation failed: {exc}")
+        _stage(
+            ctx, "tempo", "failed", f"tempo estimation failed: {exc}", started_at=started_at, input_hashes=input_hashes
+        )
         return None
     if bpm is None:
-        _stage(report, "tempo", "failed", "could not estimate a tempo")
+        _stage(ctx, "tempo", "failed", "could not estimate a tempo", started_at=started_at, input_hashes=input_hashes)
         return None
-    _stage(report, "tempo", "ok", f"{bpm} BPM")
+    _stage(ctx, "tempo", "ok", f"{bpm} BPM", started_at=started_at, input_hashes=input_hashes)
     return bpm
 
 
-def _build_vocal_melody(song, store, produced, resolve_audio_url, report):
+def _build_vocal_melody(song, store, produced, resolve_audio_url, ctx):
     """Isolated-vocal path: keep the mix and the vocal stem as artifacts so
     either can be reused. Each sub-step is skipped when its file already
     exists."""
@@ -143,18 +221,19 @@ def _build_vocal_melody(song, store, produced, resolve_audio_url, report):
 
     segments = vocal_transcribe.note_events_to_segments(vocal_transcribe.transcribe(vocal_path))
     duration_s = max((n["end_ms"] for n in segments), default=0) / 1000.0
-    bpm = _estimate_tempo(store, song_id, report)
+    bpm = _estimate_tempo(store, song_id, ctx)
     return {"notes": segments, "duration_s": duration_s, "source": "demucs+basic-pitch", "bpm": bpm}
 
 
-def _stage_melody(song, lyrics, store, produced, resolve_audio_url, report):
+def _stage_melody(song, lyrics, store, produced, resolve_audio_url, ctx):
     """Produce the melody json + .mid artifacts from the ISOLATED VOCAL only
     (Demucs -> Basic Pitch). Vocal-only and best-effort: if the ML deps are
     not installed, the song has no ytmusic id, or transcription fails, the
     song is left playable with no note guide (returns None) - there is no
     low-quality full-mix fallback (see the module docstring). Every outcome
-    is recorded in `report` so it's inspectable per song."""
+    is recorded on ctx so it's inspectable per song."""
     song_id = song["id"]
+    started_at = time.time()
     if store.exists(song_id, artifacts.KIND_MELODY):
         # Already transcribed on a previous run - reuse, and make sure the
         # MIDI exists too (it may have been deleted to force regeneration).
@@ -163,22 +242,46 @@ def _stage_melody(song, lyrics, store, produced, resolve_audio_url, report):
             store.write_bytes(song_id, artifacts.KIND_MIDI, _melody_midi_bytes(result))
         _record(produced, store, song_id, artifacts.KIND_MELODY)
         _record(produced, store, song_id, artifacts.KIND_MIDI)
-        _stage(report, "melody", "reused", f"reused {len(result.get('notes') or [])} notes from a previous run")
+        _stage(
+            ctx,
+            "melody",
+            "reused",
+            f"reused {len(result.get('notes') or [])} notes from a previous run",
+            started_at=started_at,
+            output_path=store.path(song_id, artifacts.KIND_MELODY),
+            output_hash=store.content_hash(song_id, artifacts.KIND_MELODY),
+        )
         if result.get("bpm"):
-            _stage(report, "tempo", "reused", f"{result['bpm']} BPM (from a previous run)")
+            _stage(ctx, "tempo", "reused", f"{result['bpm']} BPM (from a previous run)", started_at=started_at)
         return result
 
     if not song.get("ytmusic_video_id"):
-        _stage(report, "melody", "skipped", "no source-recording id to transcribe from")
+        _stage(ctx, "melody", "skipped", "no source-recording id to transcribe from", started_at=started_at)
         return None
     if not vocal_transcribe.available():
-        _stage(report, "melody", "skipped", "vocal-transcription add-on (Demucs + Basic Pitch) not installed")
+        _stage(
+            ctx,
+            "melody",
+            "skipped",
+            "vocal-transcription add-on (Demucs + Basic Pitch) not installed",
+            started_at=started_at,
+        )
         return None
 
     try:
-        result = _build_vocal_melody(song, store, produced, resolve_audio_url, report)
+        result = _build_vocal_melody(song, store, produced, resolve_audio_url, ctx)
     except Exception as exc:
-        _stage(report, "melody", "failed", f"vocal transcription failed: {exc}")
+        _stage(
+            ctx,
+            "melody",
+            "failed",
+            f"vocal transcription failed: {exc}",
+            started_at=started_at,
+            # Best-effort: the vocal stem may never have been written (e.g.
+            # decode/separation itself is what failed) - content_hash()
+            # returns None for a missing file rather than raising.
+            input_hashes=[store.content_hash(song_id, artifacts.KIND_VOCALS)],
+        )
         return None
 
     result["notes"] = gate_notes_to_lyrics(result.get("notes") or [], (lyrics or {}).get("synced"))
@@ -186,7 +289,16 @@ def _stage_melody(song, lyrics, store, produced, resolve_audio_url, report):
     store.write_bytes(song_id, artifacts.KIND_MIDI, _melody_midi_bytes(result))
     _record(produced, store, song_id, artifacts.KIND_MELODY)
     _record(produced, store, song_id, artifacts.KIND_MIDI)
-    _stage(report, "melody", "ok", f"transcribed {len(result['notes'])} notes from the isolated vocal")
+    _stage(
+        ctx,
+        "melody",
+        "ok",
+        f"transcribed {len(result['notes'])} notes from the isolated vocal",
+        started_at=started_at,
+        input_hashes=[store.content_hash(song_id, artifacts.KIND_VOCALS)],
+        output_path=store.path(song_id, artifacts.KIND_MELODY),
+        output_hash=store.content_hash(song_id, artifacts.KIND_MELODY),
+    )
     return result
 
 
@@ -207,17 +319,25 @@ def build_processor(store, *, fetch_lyrics, find_video, resolve_audio_url):
     Synced lyrics and a backing video are required (missing either fails the
     song); vocals/melody/MIDI are best-effort extras. Returns the result dict
     the worker stores, including an `artifacts` list of every file produced or
-    reused this run, and a `report` mapping each stage to its outcome
-    (ok/reused/skipped/failed + a human-readable detail) so a song's
-    processing is fully inspectable afterwards.
+    reused this run, a `report` mapping each stage to its outcome
+    (ok/reused/skipped/failed + a human-readable detail), and `stage_runs` -
+    the same per-stage outcomes plus timing/content-hash lineage, which the
+    library layer (not this module - see RunContext) persists to the
+    stage_runs table.
+
+    `run_id` identifies this processing attempt for lineage/log correlation.
+    LibraryWorker._process_one always supplies one (uuid4 hex); callers that
+    invoke process() directly (every existing pipeline test) get one
+    generated here so they don't have to care.
     """
 
-    def process(song):
+    def process(song, run_id=None):
+        run_id = run_id or uuid.uuid4().hex
+        ctx = RunContext(run_id, song["id"])
         produced = []
-        report = {}
-        lyrics = _stage_lyrics(song, store, produced, fetch_lyrics, report)
-        video = _stage_video(song, find_video, report)
-        melody_result = _stage_melody(song, lyrics, store, produced, resolve_audio_url, report)
+        lyrics = _stage_lyrics(song, store, produced, fetch_lyrics, ctx)
+        video = _stage_video(song, find_video, ctx)
+        melody_result = _stage_melody(song, lyrics, store, produced, resolve_audio_url, ctx)
 
         return {
             "lyrics": lyrics,
@@ -225,7 +345,9 @@ def build_processor(store, *, fetch_lyrics, find_video, resolve_audio_url):
             "duration_seconds": video.get("duration_seconds"),
             "melody": melody_result,
             "artifacts": produced,
-            "report": report,
+            "report": ctx.report,
+            "stage_runs": ctx.stage_runs,
+            "run_id": run_id,
         }
 
     return process

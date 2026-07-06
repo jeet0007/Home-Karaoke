@@ -1,3 +1,4 @@
+import hashlib
 import os
 import sys
 import tempfile
@@ -52,6 +53,29 @@ class ArtifactStoreTestCase(unittest.TestCase):
 
     def test_remove_song_safe_when_nothing_written(self):
         self.store.remove_song(999)  # no raise
+
+
+class ContentHashTestCase(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = artifacts.ArtifactStore(tmp.name)
+
+    def test_missing_file_hashes_to_none(self):
+        self.assertIsNone(self.store.content_hash(1, artifacts.KIND_MIX))
+
+    def test_hash_matches_known_bytes(self):
+        self.store.write_bytes(1, artifacts.KIND_MIX, b"hello world")
+        expected = hashlib.sha256(b"hello world").hexdigest()
+        self.assertEqual(self.store.content_hash(1, artifacts.KIND_MIX), expected)
+
+    def test_hash_changes_after_rewrite(self):
+        self.store.write_bytes(1, artifacts.KIND_MIX, b"first")
+        first_hash = self.store.content_hash(1, artifacts.KIND_MIX)
+        self.store.write_bytes(1, artifacts.KIND_MIX, b"second")
+        second_hash = self.store.content_hash(1, artifacts.KIND_MIX)
+        self.assertNotEqual(first_hash, second_hash)
+        self.assertEqual(second_hash, hashlib.sha256(b"second").hexdigest())
 
 
 if __name__ == "__main__":
