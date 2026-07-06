@@ -246,15 +246,6 @@
     padding: 0.55rem 0.85rem;
   }
 
-  .volume-group {
-    display: flex;
-    gap: 0.4rem;
-  }
-
-  .volume-group button {
-    min-width: 3.25rem;
-  }
-
   .sync-group {
     display: flex;
     align-items: center;
@@ -263,6 +254,21 @@
 
   .sync-group button {
     min-width: 4.25rem;
+  }
+
+  .singer-assist-group {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .singer-assist-group input[type="range"] {
+    width: 6.5rem;
+  }
+
+  .singer-assist-group input[hidden],
+  .singer-assist-group button[hidden] {
+    display: none;
   }
 
   .sync-display {
@@ -377,14 +383,6 @@
       grid-template-columns: 1fr 1fr;
     }
 
-    .volume-group {
-      grid-column: span 2;
-    }
-
-    .volume-group button {
-      flex: 1;
-    }
-
     .sync-group {
       grid-column: span 2;
       justify-content: center;
@@ -392,6 +390,11 @@
 
     .sync-group button {
       flex: 1;
+    }
+
+    .singer-assist-group {
+      grid-column: span 2;
+      justify-content: center;
     }
 
     .score {
@@ -425,6 +428,11 @@
          visual surface. -->
     <img id="cover-art" alt="" hidden>
     <audio id="audio" preload="auto" style="display: none;"></audio>
+    <!-- Optional singer-assist track: the isolated vocal stem produced for
+         the note guide (core/artifacts.KIND_VOCALS), played back alongside
+         the backing track at an adjustable volume. Hidden entirely for
+         songs with no stem (see static/player/singer-assist.js). -->
+    <audio id="singer-audio" preload="none" style="display: none;"></audio>
     <div id="player-overlay" class="overlay">
       <div>
         <div class="spinner" aria-hidden="true"></div>
@@ -446,10 +454,6 @@
   <section class="controls" aria-label="Playback controls">
     <button id="play-pause" type="button" disabled>Play</button>
     <button id="restart" type="button" disabled>Restart</button>
-    <div class="volume-group" aria-label="Volume controls">
-      <button id="volume-down" type="button" disabled>Vol -</button>
-      <button id="volume-up" type="button" disabled>Vol +</button>
-    </div>
     <!-- Nudge the lyrics/note-guide timeline against the backing track: the
          karaoke video's intro can be a different length than the recording
          the lyrics were timed to, so they drift. This shifts them back into
@@ -458,6 +462,23 @@
       <button id="sync-earlier" type="button" title="Lyrics earlier ([)">Lyrics -</button>
       <span id="sync-display" class="sync-display" title="Lyric timing offset">Sync 0.0s</span>
       <button id="sync-later" type="button" title="Lyrics later (])">Lyrics +</button>
+    </div>
+    <!-- Singer-assist: toggle the original isolated vocal in as a guide
+         track. The slider only appears while it's on (see
+         static/player/singer-assist.js). Hidden entirely for songs with no
+         vocal stem processed yet. -->
+    <div class="singer-assist-group" aria-label="Singer assist">
+      <button id="singer-assist-toggle" type="button" aria-pressed="false" hidden>Singer: Off</button>
+      <input
+        id="singer-assist-volume"
+        type="range"
+        min="0"
+        max="1"
+        step="0.01"
+        value="0.5"
+        aria-label="Singer vocal volume"
+        hidden
+      >
     </div>
     <div id="bpm-chip" class="bpm-chip" aria-label="Tempo" hidden></div>
     <div class="score" aria-label="Score">Score: <span>★ --</span></div>

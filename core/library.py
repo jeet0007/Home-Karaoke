@@ -239,9 +239,7 @@ class SongLibrary:
             row = conn.execute("SELECT * FROM songs WHERE id = ?", (song_id,)).fetchone()
         if row is None:
             return None
-        payload = self.full_payload(row)
-        payload["artifacts"] = self.list_artifacts(song_id)
-        return payload
+        return self.full_payload(row)
 
     def list_songs(self, status=None, limit=200):
         query = "SELECT * FROM songs"
@@ -416,14 +414,19 @@ class SongLibrary:
         summary["stages"] = {stage: entry.get("status") for stage, entry in report.items()}
         return summary
 
-    @staticmethod
-    def full_payload(row):
-        payload = SongLibrary.summary(row)
+    def full_payload(self, row):
+        payload = self.summary(row)
         payload["lyrics"] = _json_or_none(row["lyrics_json"])
         payload["melody"] = _json_or_none(row["melody_json"])
         # The full per-stage report: each stage's status plus a human-readable
         # "detail" explaining what passed, was skipped, or failed and why.
         payload["report"] = _json_or_none(row["report_json"]) or {}
+        # Needed by /select-song's library fast path to tell the player
+        # whether a singer-vocal stem exists to offer as a toggleable assist
+        # track (see artifacts.KIND_VOCALS) - not just ready songs served via
+        # get_full() need this, so it lives here rather than bolted onto only
+        # one caller.
+        payload["artifacts"] = self.list_artifacts(row["id"])
         return payload
 
 

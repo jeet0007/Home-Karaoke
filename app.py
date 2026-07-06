@@ -428,7 +428,9 @@ def _serve_library_song(payload):
 
     lyrics_result = payload.get("lyrics") or {}
     melody_result = payload.get("melody") or {}
+    has_singer_vocals = any(a["kind"] == artifacts.KIND_VOCALS for a in payload.get("artifacts") or [])
     response = {
+        "song_id": payload["id"],
         "artist": payload["artist"],
         "title": payload["title"],
         "duration_seconds": payload.get("duration_seconds"),
@@ -442,6 +444,7 @@ def _serve_library_song(payload):
         "bpm": melody_result.get("bpm"),
         "video_id": video_id,
         "source": "library",
+        "has_singer_vocals": has_singer_vocals,
     }
 
     threading.Thread(target=_prewarm_stream_cache, args=(video_id,), daemon=True).start()
@@ -633,6 +636,19 @@ def library_song_midi(song_id):
     if artifact is None or not os.path.isfile(artifact["path"]):
         return jsonify({"error": "no MIDI available for this song"}), 404
     return send_file(artifact["path"], mimetype="audio/midi", as_attachment=True, download_name=f"song-{song_id}.mid")
+
+
+@app.route("/library/song/<int:song_id>/vocals")
+def library_song_vocals(song_id):
+    """Stream the isolated vocal stem (the pipeline's Demucs output) so the
+    player can offer it as a toggleable "singer assist" track alongside the
+    backing video's audio. Presentation only: serves a stored artifact,
+    never generates one - best-effort like the note guide, so this 404s for
+    songs processed without the ML add-on installed."""
+    artifact = song_library.get_artifact(song_id, artifacts.KIND_VOCALS)
+    if artifact is None or not os.path.isfile(artifact["path"]):
+        return jsonify({"error": "no singer vocal track available for this song"}), 404
+    return send_file(artifact["path"], mimetype="audio/wav")
 
 
 @app.route("/library/seed-charts", methods=["POST"])

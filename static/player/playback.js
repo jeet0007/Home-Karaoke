@@ -1,8 +1,9 @@
-// Audio playback controls (play/pause/restart/volume) and stream-URL
-// resolution. The video is never shown - only its audio track streams in
-// the background (see templates/player.html for why an <audio> element,
-// not a hidden <video>, drives playback); the cover art is the whole
-// visual surface.
+// Audio playback controls (play/pause/restart) and stream-URL resolution.
+// The video is never shown - only its audio track streams in the
+// background (see templates/player.html for why an <audio> element, not a
+// hidden <video>, drives playback); the cover art is the whole visual
+// surface. No volume control: this plays on a TV (remote) or device
+// (hardware/OS controls already cover it).
 
 import { setOverlayLoading, setOverlayError, hideOverlay } from './overlay.js';
 import { ensureGradingStarted } from './grading.js';
@@ -12,11 +13,9 @@ import { effectiveLyricMs } from './sync-offset.js';
 const audio = document.getElementById('audio');
 const playPauseBtn = document.getElementById('play-pause');
 const restartBtn = document.getElementById('restart');
-const volumeDownBtn = document.getElementById('volume-down');
-const volumeUpBtn = document.getElementById('volume-up');
 
 export function enableControls() {
-  [playPauseBtn, restartBtn, volumeDownBtn, volumeUpBtn].forEach((button) => {
+  [playPauseBtn, restartBtn].forEach((button) => {
     button.disabled = false;
   });
 }
@@ -55,11 +54,6 @@ export async function restartPlayback() {
   }
   ensureGradingStarted();
   setPlayButton();
-}
-
-export function changeVolume(delta) {
-  audio.muted = false;
-  audio.volume = Math.max(0, Math.min(1, audio.volume + delta));
 }
 
 export async function loadStream(videoId) {
