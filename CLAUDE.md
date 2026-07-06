@@ -35,7 +35,7 @@ core/             the "music -> MIDI" engine + persistence (no web deps)
   vocal_transcribe.py  Demucs -> Basic Pitch vocal transcription — the ONLY melody source, opt-in via requirements-ml.txt
   midi.py           dependency-free Standard MIDI File writer
   audio.py          shared ffmpeg audio-decode helper
-  audio_grading.py  live pitch/melody scoring (the /grade WebSocket)
+  audio_grading.py  live pitch/melody scoring - reference implementation + final fallback tier for the /grade WebSocket; see wasm/grading/ for the primary, client-side path
 search/           finding songs + backing videos
   song_search.py    ytmusicapi song-identity search + charts
   karaoke_search.py yt-dlp karaoke-video ranking (karaoke/instrumental boosted, covers/reactions penalised)
@@ -46,7 +46,8 @@ lyrics/           multi-source lyrics
   lrclib_client.py  direct LRCLIB API client (fallback, used if Lyrica is down/absent/has no synced lyrics)
   lyrics_sources.py Lyrica-first / LRCLIB-fallback ordering
   lyrics_filter.py  pre-selection lyrics-availability filtering
-templates/ static/  the vanilla-JS player + search GUI
+wasm/grading/     Rust port of core/audio_grading.py's YIN pitch detector + RealtimeGrader, compiled to WASM (dev-time-only Rust dep; compiled output is checked into static/player/wasm/, see wasm/grading/README.md)
+templates/ static/  the vanilla-JS player + search GUI (static/player/grading.js runs live grading client-side via the WASM module inside static/grading-worklet.js, an AudioWorklet, falling back to the /grade WebSocket only if WebAssembly is unavailable)
 tests/            unittest suite (mirrors the modules above)
 ```
 

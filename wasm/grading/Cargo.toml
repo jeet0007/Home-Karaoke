@@ -1,0 +1,18 @@
+[package]
+name = "karaoke-grading-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "Client-side port of core/audio_grading.py's YIN pitch detector + RealtimeGrader scoring, compiled to WASM for static/grading-worklet.js. See README.md for the build command."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true

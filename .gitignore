@@ -10,3 +10,13 @@ logs/
 .DS_Store
 .mcp.json
 .claude
+
+# Rust build artifacts for wasm/grading/ - only the wasm-pack output
+# checked into static/player/wasm/ is part of the shipped app; see
+# wasm/grading/README.md for the rebuild command.
+wasm/grading/target/
+# `--target nodejs` build used only to reproduce wasm/grading/cross_check/
+# locally (see wasm/grading/README.md) - not part of the shipped app or
+# the browser build in static/player/wasm/.
+wasm/grading/cross_check/pkg-node/
+wasm/grading/cross_check/wasm_output.json

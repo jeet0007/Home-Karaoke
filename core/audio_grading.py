@@ -28,6 +28,18 @@ Pitch detection uses a from-scratch YIN autocorrelation implementation
 was chosen over aubio (native build failed in this environment) and over
 librosa (works, but pulls in scipy/numba/scikit-learn for a batch/file
 oriented API when we only need small streaming frames).
+
+As of the WASM live-grading migration, this module (and the /grade
+WebSocket in app.py that serves it) is no longer the primary grading
+path - see wasm/grading/ (a Rust port of the YIN detector + RealtimeGrader
+below, same constants/algorithm/scoring) and static/player/grading.js,
+which run the same computation client-side with no network round trip.
+This module is kept, deliberately unmodified, as: (1) the reference
+implementation the Rust port is cross-checked against (see
+wasm/grading/README.md), and (2) the final fallback in
+static/player/grading.js's three-tier backend ladder, used only if
+WebAssembly itself is unavailable or fails to load. Changes to the
+scoring algorithm/constants need to land in both places to stay in sync.
 """
 
 import collections
