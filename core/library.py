@@ -30,6 +30,7 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 
 STATUS_PENDING = "pending"
 STATUS_PROCESSING = "processing"
@@ -80,6 +81,25 @@ CREATE TABLE IF NOT EXISTS artifacts (
     PRIMARY KEY (song_id, kind),
     FOREIGN KEY (song_id) REFERENCES songs(id)
 );
+
+CREATE TABLE IF NOT EXISTS stage_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    song_id INTEGER NOT NULL,
+    run_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    finished_at REAL NOT NULL,
+    duration_ms INTEGER,
+    input_hashes_json TEXT,
+    output_path TEXT,
+    output_hash TEXT,
+    error TEXT,
+    detail TEXT,
+    FOREIGN KEY (song_id) REFERENCES songs(id)
+);
+CREATE INDEX IF NOT EXISTS idx_stage_runs_song_id ON stage_runs(song_id);
+CREATE INDEX IF NOT EXISTS idx_stage_runs_run_id ON stage_runs(run_id);
 """
 
 _SUMMARY_FIELDS = (
@@ -103,11 +123,14 @@ class ProcessingError(Exception):
     unexpected crashes, which are stored with a generic prefix instead.
 
     `report` carries the partial per-stage processing report built so far, so
-    a failed song still shows which stages passed before the failing one."""
+    a failed song still shows which stages passed before the failing one.
+    `stage_runs` is the same partial run's stage_runs lineage rows (additive -
+    pipeline.py stays DB-agnostic; the worker is what persists them)."""
 
-    def __init__(self, message, report=None):
+    def __init__(self, message, report=None, stage_runs=None):
         super().__init__(message)
         self.report = report
+        self.stage_runs = stage_runs
 
 
 def _json_or_none(text):
@@ -329,6 +352,56 @@ class SongLibrary:
                 (STATUS_FAILED, str(error)[:500], json.dumps(report) if report else None, time.time(), song_id),
             )
 
+    # -- stage_runs lineage --------------------------------------------------
+    #
+    # One row per _stage() call in a pipeline run - timing, content hashes,
+    # and outcome. Append-only (surrogate PK): (song_id, stage) legitimately
+    # repeats across reprocessing runs, and no historical backfill is done -
+    # the table starts empty, only runs from this feature forward appear here.
+
+    def record_stage_runs(self, song_id, run_id, stage_runs):
+        """Persist one run's stage_runs rows. No-op on an empty list, which
+        covers a bare crash before any stage completed - nothing to record."""
+        if not stage_runs:
+            return
+        with self._db() as conn:
+            for entry in stage_runs:
+                conn.execute(
+                    "INSERT INTO stage_runs (song_id, run_id, stage, status, started_at, finished_at,"
+                    " duration_ms, input_hashes_json, output_path, output_hash, error, detail)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        song_id,
+                        run_id,
+                        entry["stage"],
+                        entry["status"],
+                        entry["started_at"],
+                        entry["finished_at"],
+                        entry.get("duration_ms"),
+                        json.dumps(entry["input_hashes"]) if entry.get("input_hashes") else None,
+                        entry.get("output_path"),
+                        entry.get("output_hash"),
+                        entry.get("error"),
+                        entry.get("detail"),
+                    ),
+                )
+
+    def list_stage_runs(self, song_id):
+        with self._db() as conn:
+            rows = conn.execute("SELECT * FROM stage_runs WHERE song_id = ? ORDER BY id", (song_id,)).fetchall()
+        return [self._stage_run_row(row) for row in rows]
+
+    def list_stage_runs_for_run(self, run_id):
+        with self._db() as conn:
+            rows = conn.execute("SELECT * FROM stage_runs WHERE run_id = ? ORDER BY id", (run_id,)).fetchall()
+        return [self._stage_run_row(row) for row in rows]
+
+    @staticmethod
+    def _stage_run_row(row):
+        entry = dict(row)
+        entry["input_hashes"] = _json_or_none(entry.pop("input_hashes_json"))
+        return entry
+
     # -- row shaping -------------------------------------------------------
 
     @staticmethod
@@ -381,15 +454,21 @@ class LibraryWorker(threading.Thread):
             self._process_one(song)
 
     def _process_one(self, song):
+        run_id = uuid.uuid4().hex
         try:
-            result = self.process_song(song)
+            result = self.process_song(song, run_id=run_id)
         except ProcessingError as exc:
+            self.library.record_stage_runs(song["id"], run_id, getattr(exc, "stage_runs", None) or [])
             self.library.mark_failed(song["id"], str(exc), report=getattr(exc, "report", None))
             return
         except Exception as exc:  # pipeline bug/infra failure - keep the worker alive
+            # No stage_runs to record here: an exception that isn't a
+            # ProcessingError means the pipeline crashed before any stage
+            # completed (or outside its stage bookkeeping entirely).
             self.library.mark_failed(song["id"], f"unexpected error: {exc}")
             return
 
+        self.library.record_stage_runs(song["id"], run_id, result.get("stage_runs") or [])
         self.library.mark_ready(
             song["id"],
             video_id=result["video_id"],

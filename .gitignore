@@ -5,6 +5,7 @@ sidecar/
 .env
 library.db*
 data/
+logs/
 .venv*
 .DS_Store
 .mcp.json

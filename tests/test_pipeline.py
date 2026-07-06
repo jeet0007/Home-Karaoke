@@ -209,6 +209,13 @@ class ProcessingReportTestCase(unittest.TestCase):
         except library.ProcessingError as exc:
             self.assertEqual(exc.report["lyrics"]["status"], "ok")  # lyrics passed before video failed
             self.assertEqual(exc.report["video"]["status"], "failed")
+            # stage_runs carries the same partial lineage - completed stages
+            # (lyrics) plus the one that failed (video), in order.
+            stages = [row["stage"] for row in exc.stage_runs]
+            self.assertEqual(stages, ["lyrics", "video"])
+            self.assertEqual(exc.stage_runs[0]["status"], "ok")
+            self.assertEqual(exc.stage_runs[1]["status"], "failed")
+            self.assertEqual(exc.stage_runs[1]["error"], "no karaoke backing track found")
 
 
 class TempoTestCase(unittest.TestCase):
@@ -267,6 +274,69 @@ class TempoTestCase(unittest.TestCase):
             data = handle.read()
         expected = (round(60_000_000 / 90.0)).to_bytes(3, "big")
         self.assertIn(b"\xff\x51\x03" + expected, data)
+
+
+class StageRunsTestCase(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = artifacts.ArtifactStore(tmp.name)
+
+    def _build(self, **overrides):
+        steps = {
+            "fetch_lyrics": lambda a, t, d: LYRICS,
+            "find_video": lambda a, t, d: VIDEO,
+            "resolve_audio_url": lambda ytm: f"https://audio/{ytm}",
+        }
+        steps.update(overrides)
+        return pipeline.build_processor(self.store, **steps)
+
+    def test_stage_runs_carry_timing_for_every_stage(self):
+        with _vocal_stubs():
+            result = self._build()(_song())
+        by_stage = {row["stage"]: row for row in result["stage_runs"]}
+        self.assertEqual(set(by_stage), {"lyrics", "video", "tempo", "melody"})
+        for row in by_stage.values():
+            self.assertGreaterEqual(row["finished_at"], row["started_at"])
+            self.assertGreaterEqual(row["duration_ms"], 0)
+
+    def test_ok_stages_carry_output_hash_video_does_not(self):
+        with _vocal_stubs():
+            result = self._build()(_song())
+        by_stage = {row["stage"]: row for row in result["stage_runs"]}
+        self.assertIsNotNone(by_stage["lyrics"]["output_hash"])
+        self.assertIsNotNone(by_stage["melody"]["output_hash"])
+        self.assertIsNone(by_stage["video"]["output_hash"])  # no file I/O for this stage
+
+    def test_reused_melody_carries_output_hash(self):
+        self.store.write_json(
+            1,
+            artifacts.KIND_MELODY,
+            {"notes": [{"start_ms": 0, "end_ms": 500, "midi": 60}], "source": "demucs+basic-pitch"},
+        )
+        result = self._build()(_song())
+        by_stage = {row["stage"]: row for row in result["stage_runs"]}
+        self.assertEqual(by_stage["melody"]["status"], "reused")
+        self.assertIsNotNone(by_stage["melody"]["output_hash"])
+
+    def test_failed_melody_carries_best_effort_input_hash(self):
+        with _vocal_stubs(decode=mock.Mock(side_effect=RuntimeError("ffmpeg exploded"))):
+            result = self._build()(_song())
+        by_stage = {row["stage"]: row for row in result["stage_runs"]}
+        self.assertEqual(by_stage["melody"]["status"], "failed")
+        # No vocal stem was ever written (decode itself failed) - the hash
+        # is None rather than an error.
+        self.assertIsNone(by_stage["melody"]["input_hashes"][0])
+
+    def test_run_id_defaults_when_not_supplied(self):
+        with _vocal_stubs():
+            result = self._build()(_song())
+        self.assertTrue(result["run_id"])
+
+    def test_run_id_propagates_when_supplied(self):
+        with _vocal_stubs():
+            result = self._build()(_song(), run_id="explicit-run-id")
+        self.assertEqual(result["run_id"], "explicit-run-id")
 
 
 class GateNotesToLyricsTestCase(unittest.TestCase):
