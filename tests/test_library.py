@@ -99,16 +99,98 @@ class QueueMechanicsTestCase(unittest.TestCase):
         claimed = self.lib.claim_next_pending()
         self.assertEqual(claimed["id"], song["id"])
 
-        # Backdate the processing claim past the staleness horizon.
+        # claim_next_pending() stamped a fresh heartbeat_at at claim time;
+        # simulate the worker dying by backdating it (and updated_at, for
+        # realism) past the staleness horizon.
         with self.lib._db() as conn:
             conn.execute(
-                "UPDATE songs SET updated_at = ? WHERE id = ?",
-                (time.time() - library.STALE_PROCESSING_SECONDS - 1, song["id"]),
+                "UPDATE songs SET updated_at = ?, heartbeat_at = ? WHERE id = ?",
+                (
+                    time.time() - library.STALE_PROCESSING_SECONDS - 1,
+                    time.time() - library.STALE_PROCESSING_SECONDS - 1,
+                    song["id"],
+                ),
             )
 
         rescued = self.lib.claim_next_pending()
         self.assertIsNotNone(rescued)
         self.assertEqual(rescued["id"], song["id"])
+
+    def test_pre_heartbeat_claim_falls_back_to_claim_age(self):
+        # A row claimed by a pre-heartbeat version of this code (or one
+        # whose heartbeat column was never populated) has heartbeat_at NULL
+        # forever - COALESCE(heartbeat_at, updated_at) still lets it be
+        # reclaimed, judged by claim age instead.
+        song = self.lib.enqueue("Artist", "Stuck")
+        self.lib.claim_next_pending()
+        with self.lib._db() as conn:
+            conn.execute(
+                "UPDATE songs SET updated_at = ?, heartbeat_at = NULL WHERE id = ?",
+                (time.time() - library.STALE_PROCESSING_SECONDS - 1, song["id"]),
+            )
+        rescued = self.lib.claim_next_pending()
+        self.assertIsNotNone(rescued)
+        self.assertEqual(rescued["id"], song["id"])
+
+    def test_stale_reclaim_is_judged_by_heartbeat_not_claim_age(self):
+        # A slow-but-alive stage (Demucs can run minutes) must NOT be
+        # reclaimed just because the claim itself is old - only a stopped
+        # heartbeat means the worker is actually gone.
+        song = self.lib.enqueue("Artist", "SlowButAlive")
+        claimed = self.lib.claim_next_pending()
+        with self.lib._db() as conn:
+            conn.execute(
+                "UPDATE songs SET updated_at = ?, heartbeat_at = ? WHERE id = ?",
+                (time.time() - library.STALE_PROCESSING_SECONDS - 1, time.time(), claimed["id"]),
+            )
+        self.assertIsNone(self.lib.claim_next_pending())  # fresh heartbeat -> not reclaimed
+
+        self.lib.beat(claimed["id"])  # still alive
+        self.assertIsNone(self.lib.claim_next_pending())
+
+        with self.lib._db() as conn:
+            conn.execute(
+                "UPDATE songs SET heartbeat_at = ? WHERE id = ?",
+                (time.time() - library.STALE_PROCESSING_SECONDS - 1, claimed["id"]),
+            )
+        rescued = self.lib.claim_next_pending()
+        self.assertIsNotNone(rescued)
+        self.assertEqual(rescued["id"], song["id"])
+
+    def test_claim_prefers_higher_priority_over_fifo_order(self):
+        a = self.lib.enqueue("Artist", "Backfill", priority=library.PRIORITY_BACKFILL)
+        b = self.lib.enqueue("Artist", "UserPick", priority=library.PRIORITY_USER)
+        # Enqueued in FIFO order a-then-b, but b (higher priority) claims first.
+        self.assertEqual(self.lib.claim_next_pending()["id"], b["id"])
+        self.assertEqual(self.lib.claim_next_pending()["id"], a["id"])
+
+    def test_user_priority_enqueue_promotes_a_pending_backfill_song(self):
+        song = self.lib.enqueue("Artist", "Backfill", priority=library.PRIORITY_BACKFILL)
+        other = self.lib.enqueue("Artist", "Other", priority=library.PRIORITY_BACKFILL)
+        # A user pick of the SAME identity while it's still queued bumps it
+        # ahead of same-priority backfill work already in the queue.
+        self.lib.enqueue("Artist", "Backfill", priority=library.PRIORITY_USER)
+        self.assertEqual(self.lib.claim_next_pending()["id"], song["id"])
+        self.assertEqual(self.lib.claim_next_pending()["id"], other["id"])
+
+    def test_beat_and_set_current_stage(self):
+        song = self.lib.enqueue("Artist", "One")
+        claimed = self.lib.claim_next_pending()
+
+        self.lib.set_current_stage(claimed["id"], "separate")
+        row = self.lib.get(claimed["id"])
+        self.assertEqual(row["current_stage"], "separate")
+
+        self.lib.beat(claimed["id"])  # doesn't clobber the stage, just the heartbeat
+        self.assertEqual(self.lib.get(claimed["id"])["current_stage"], "separate")
+
+    def test_beat_is_a_no_op_on_a_settled_song(self):
+        song = self.lib.enqueue("Artist", "One")
+        self.lib.mark_ready(song["id"], video_id="v", lyrics=LYRICS)
+        self.lib.beat(song["id"])  # must not resurrect bookkeeping on a ready row
+        with self.lib._db() as conn:
+            row = conn.execute("SELECT heartbeat_at FROM songs WHERE id = ?", (song["id"],)).fetchone()
+        self.assertIsNone(row["heartbeat_at"])
 
     def test_list_songs_filters_by_status(self):
         a = self.lib.enqueue("Artist", "One")
@@ -331,6 +413,44 @@ class StageRunsTestCase(unittest.TestCase):
         self.assertEqual(lib.list_stage_runs(1), [])
 
 
+class StageStatsTestCase(unittest.TestCase):
+    def setUp(self):
+        self.lib = _temp_library(self)
+
+    def test_aggregates_stage_timing_and_song_census(self):
+        song = self.lib.enqueue("Passenger", "Let Her Go")
+        self.lib.record_stage_runs(
+            song["id"],
+            "run-1",
+            [
+                {
+                    "stage": "lyrics", "status": "ok", "started_at": 0, "finished_at": 0.2,
+                    "duration_ms": 200, "input_hashes": None, "output_path": None,
+                    "output_hash": None, "error": None, "detail": "",
+                },
+                {
+                    "stage": "lyrics", "status": "ok", "started_at": 0, "finished_at": 0.4,
+                    "duration_ms": 400, "input_hashes": None, "output_path": None,
+                    "output_hash": None, "error": None, "detail": "",
+                },
+            ],
+        )
+        self.lib.mark_ready(song["id"], video_id="v", lyrics=LYRICS)
+        other = self.lib.enqueue("Artist", "Two")
+        self.lib.mark_failed(other["id"], "boom")
+
+        stats = self.lib.stage_stats()
+        self.assertEqual(stats["songs"], {"ready": 1, "failed": 1})
+        lyrics_row = next(r for r in stats["stages"] if r["stage"] == "lyrics" and r["status"] == "ok")
+        self.assertEqual(lyrics_row["runs"], 2)
+        self.assertEqual(lyrics_row["avg_ms"], 300)
+        self.assertEqual(lyrics_row["max_ms"], 400)
+
+    def test_empty_library_yields_empty_stats(self):
+        stats = self.lib.stage_stats()
+        self.assertEqual(stats, {"songs": {}, "stages": []})
+
+
 class LibraryWorkerTestCase(unittest.TestCase):
     def setUp(self):
         self.lib = _temp_library(self)
@@ -350,7 +470,7 @@ class LibraryWorkerTestCase(unittest.TestCase):
     def test_worker_processes_queue_to_ready(self):
         song = self.lib.enqueue("Passenger", "Let Her Go")
 
-        def process(_song, run_id=None):
+        def process(_song, run_id=None, observer=None):
             return {"video_id": "vid123", "lyrics": LYRICS, "melody": None, "artifacts": ARTIFACTS}
 
         self._run_worker_until(
@@ -364,7 +484,7 @@ class LibraryWorkerTestCase(unittest.TestCase):
     def test_worker_marks_processing_error_as_failed_with_message(self):
         song = self.lib.enqueue("Obscure", "B-side")
 
-        def process(_song, run_id=None):
+        def process(_song, run_id=None, observer=None):
             raise library.ProcessingError("no synced lyrics found in any source")
 
         self._run_worker_until(
@@ -376,7 +496,7 @@ class LibraryWorkerTestCase(unittest.TestCase):
         bad = self.lib.enqueue("Artist", "Crashy")
         good = self.lib.enqueue("Artist", "Fine")
 
-        def process(song, run_id=None):
+        def process(song, run_id=None, observer=None):
             if song["title"] == "Crashy":
                 raise RuntimeError("boom")
             return {"video_id": "vid123", "lyrics": LYRICS, "melody": None}
@@ -392,7 +512,7 @@ class LibraryWorkerTestCase(unittest.TestCase):
         song = self.lib.enqueue("Passenger", "Let Her Go")
         seen_run_ids = []
 
-        def process(_song, run_id=None):
+        def process(_song, run_id=None, observer=None):
             seen_run_ids.append(run_id)
             return {"video_id": "vid123", "lyrics": LYRICS, "melody": None}
 
@@ -402,19 +522,19 @@ class LibraryWorkerTestCase(unittest.TestCase):
         self.assertEqual(len(seen_run_ids), 1)
         self.assertTrue(seen_run_ids[0])  # non-empty - LibraryWorker generated one
 
-    def test_worker_persists_stage_runs_on_success(self):
+    def test_worker_persists_stage_runs_via_observer_as_they_land(self):
+        # The real pipeline notifies the observer per-stage (see
+        # RunContext.notify in pipeline.py) rather than handing the worker a
+        # batch at the end - that's what makes lineage crash-proof. This
+        # stub plays that role: it calls observer("stage_end", ...) itself,
+        # the same way _stage() does inside pipeline.py.
         song = self.lib.enqueue("Passenger", "Let Her Go")
         captured = {}
 
-        def process(_song, run_id=None):
+        def process(_song, run_id=None, observer=None):
             captured["run_id"] = run_id
-            return {
-                "video_id": "vid123",
-                "lyrics": LYRICS,
-                "melody": None,
-                "artifacts": ARTIFACTS,
-                "stage_runs": [dict(STAGE_RUNS[0])],
-            }
+            observer("stage_end", dict(STAGE_RUNS[0]))
+            return {"video_id": "vid123", "lyrics": LYRICS, "melody": None, "artifacts": ARTIFACTS}
 
         self._run_worker_until(
             process, lambda: self.lib.get(song["id"])["status"] == library.STATUS_READY
@@ -427,10 +547,9 @@ class LibraryWorkerTestCase(unittest.TestCase):
     def test_worker_persists_stage_runs_on_processing_error(self):
         song = self.lib.enqueue("Obscure", "B-side")
 
-        def process(_song, run_id=None):
-            raise library.ProcessingError(
-                "no synced lyrics found in any source", stage_runs=[dict(STAGE_RUNS[1])]
-            )
+        def process(_song, run_id=None, observer=None):
+            observer("stage_end", dict(STAGE_RUNS[1]))
+            raise library.ProcessingError("no synced lyrics found in any source")
 
         self._run_worker_until(
             process, lambda: self.lib.get(song["id"])["status"] == library.STATUS_FAILED
@@ -440,10 +559,41 @@ class LibraryWorkerTestCase(unittest.TestCase):
         self.assertEqual(rows[0]["stage"], "tempo")
         self.assertEqual(rows[0]["status"], "failed")
 
+    def test_stage_begin_sets_current_stage_while_processing(self):
+        song = self.lib.enqueue("Passenger", "Let Her Go")
+        seen = {}
+
+        def process(_song, run_id=None, observer=None):
+            observer("stage_begin", "melody")
+            seen["current_stage"] = self.lib.get(_song["id"])["current_stage"]
+            return {"video_id": "vid123", "lyrics": LYRICS, "melody": None}
+
+        self._run_worker_until(
+            process, lambda: self.lib.get(song["id"])["status"] == library.STATUS_READY
+        )
+        self.assertEqual(seen["current_stage"], "melody")
+        # Settled songs don't carry a stale in-flight stage.
+        self.assertIsNone(self.lib.get(song["id"])["current_stage"])
+
+    def test_observer_exceptions_never_fail_the_song(self):
+        # A malformed stage_end payload (missing required keys) would raise
+        # inside record_stage_run - telemetry plumbing must never take the
+        # song down with it.
+        song = self.lib.enqueue("Passenger", "Let Her Go")
+
+        def process(_song, run_id=None, observer=None):
+            observer("stage_end", {"status": "ok"})  # missing "stage" -> KeyError, swallowed
+            observer("bogus_event", "whatever")  # unknown events are also a no-op
+            return {"video_id": "vid123", "lyrics": LYRICS, "melody": None}
+
+        self._run_worker_until(
+            process, lambda: self.lib.get(song["id"])["status"] == library.STATUS_READY
+        )
+
     def test_worker_records_no_stage_runs_on_bare_crash(self):
         song = self.lib.enqueue("Artist", "Crashy")
 
-        def process(_song, run_id=None):
+        def process(_song, run_id=None, observer=None):
             raise RuntimeError("boom")
 
         self._run_worker_until(

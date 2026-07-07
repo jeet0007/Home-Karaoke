@@ -33,9 +33,12 @@ def _vocal_stubs(decode=None, separate=None, transcribe_return=NOTE_EVENTS, avai
             handle.write(b"MIX")
         return out_path
 
-    def default_separate(mix_path, vocal_path):
+    def default_separate(mix_path, vocal_path, instrumental_path=None):
         with open(vocal_path, "wb") as handle:
             handle.write(b"VOX")
+        if instrumental_path:
+            with open(instrumental_path, "wb") as handle:
+                handle.write(b"INST")
         return vocal_path
 
     with mock.patch.object(pipeline.vocal_transcribe, "available", return_value=available), mock.patch.object(
@@ -81,7 +84,7 @@ class PipelineTestCase(unittest.TestCase):
         self.assertEqual(result["melody"]["source"], "demucs+basic-pitch")
         self.assertEqual([n["midi"] for n in result["melody"]["notes"]], [60, 62])
         kinds = {a["kind"] for a in result["artifacts"]}
-        self.assertEqual(kinds, {"lyrics", "mix", "vocals", "melody", "midi"})
+        self.assertEqual(kinds, {"lyrics", "mix", "vocals", "instrumental", "melody", "midi"})
         self.assertTrue(self.store.exists(1, artifacts.KIND_MIDI))
         with open(self.store.path(1, artifacts.KIND_MIDI), "rb") as handle:
             self.assertEqual(handle.read(4), b"MThd")
@@ -95,24 +98,34 @@ class PipelineTestCase(unittest.TestCase):
                 handle.write(b"MIX")
             return out_path
 
-        def fake_separate(mix_path, vocal_path):
+        def fake_separate(mix_path, vocal_path, instrumental_path=None):
             separate_calls.append(mix_path)
             with open(vocal_path, "wb") as handle:
                 handle.write(b"VOX")
+            if instrumental_path:
+                with open(instrumental_path, "wb") as handle:
+                    handle.write(b"INST")
             return vocal_path
 
         with _vocal_stubs(decode=fake_decode, separate=fake_separate):
             self._build()(_song())
 
-        # The mix + vocal stem are persisted (the user's "singer audio").
+        # The mix + both stems are persisted (singer audio + backing track),
+        # from ONE decode and ONE Demucs pass - the instrumental stage reuses
+        # what the melody stage's separation already wrote.
         self.assertTrue(self.store.exists(1, artifacts.KIND_VOCALS))
+        self.assertTrue(self.store.exists(1, artifacts.KIND_INSTRUMENTAL))
         self.assertTrue(self.store.exists(1, artifacts.KIND_MIX))
         self.assertEqual(len(decode_calls), 1)
         self.assertEqual(len(separate_calls), 1)
 
     def test_reuses_vocal_stem_without_re_separating(self):
-        # Vocal stem already on disk: transcription reruns, decode + Demucs don't.
+        # Both stems already on disk: transcription reruns, decode + Demucs
+        # don't. (A vocal stem WITHOUT an instrumental is the legacy backfill
+        # case - covered in InstrumentalStageTestCase - where separation
+        # legitimately reruns.)
         self.store.write_bytes(1, artifacts.KIND_VOCALS, b"VOX")
+        self.store.write_bytes(1, artifacts.KIND_INSTRUMENTAL, b"INST")
         boom = mock.Mock(side_effect=AssertionError("should not run"))
         with _vocal_stubs(decode=boom, separate=boom):
             result = self._build()(_song())
@@ -120,9 +133,12 @@ class PipelineTestCase(unittest.TestCase):
 
     def test_melody_stage_skips_when_already_present(self):
         # Pre-seed a stored melody: no audio resolve, no transcription.
+        # (available=False keeps the instrumental backfill from resolving
+        # audio either - its own paths are covered in InstrumentalStageTestCase.)
         self.store.write_json(1, artifacts.KIND_MELODY, {"notes": [{"start_ms": 0, "end_ms": 500, "midi": 60}], "source": "demucs+basic-pitch"})
         resolve = mock.Mock(side_effect=AssertionError("audio should not be resolved"))
-        result = self._build(resolve_audio_url=resolve)(_song())
+        with _vocal_stubs(available=False):
+            result = self._build(resolve_audio_url=resolve)(_song())
         resolve.assert_not_called()
         self.assertEqual(result["melody"]["notes"][0]["midi"], 60)
         self.assertTrue(self.store.exists(1, artifacts.KIND_MIDI))  # regenerated
@@ -159,6 +175,91 @@ class PipelineTestCase(unittest.TestCase):
         self.assertEqual(result["melody"]["notes"], [{"start_ms": 0, "end_ms": 500, "midi": 60}])
 
 
+class InstrumentalStageTestCase(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = artifacts.ArtifactStore(tmp.name)
+
+    def _build(self, **overrides):
+        steps = {
+            "fetch_lyrics": lambda a, t, d: LYRICS,
+            "find_video": lambda a, t, d: VIDEO,
+            "resolve_audio_url": lambda ytm: f"https://audio/{ytm}",
+        }
+        steps.update(overrides)
+        return pipeline.build_processor(self.store, **steps)
+
+    def _seed_processed_song(self, with_instrumental=False):
+        """A song from before the instrumental artifact existed: melody,
+        vocal stem, and mix kept on disk."""
+        self.store.write_json(
+            1, artifacts.KIND_MELODY, {"notes": [{"start_ms": 0, "end_ms": 500, "midi": 60}], "source": "demucs+basic-pitch"}
+        )
+        self.store.write_bytes(1, artifacts.KIND_VOCALS, b"VOX")
+        self.store.write_bytes(1, artifacts.KIND_MIX, b"MIX")
+        if with_instrumental:
+            self.store.write_bytes(1, artifacts.KIND_INSTRUMENTAL, b"INST")
+
+    def test_fresh_run_produces_instrumental_from_the_same_separation(self):
+        with _vocal_stubs():
+            result = self._build()(_song())
+        self.assertTrue(self.store.exists(1, artifacts.KIND_INSTRUMENTAL))
+        self.assertIn("instrumental", {a["kind"] for a in result["artifacts"]})
+        self.assertEqual(result["report"]["instrumental"]["status"], "ok")
+
+    def test_backfills_instrumental_for_previously_processed_song(self):
+        self._seed_processed_song()
+        separate_calls = []
+
+        def fake_separate(mix_path, vocal_path, instrumental_path=None):
+            separate_calls.append(instrumental_path)
+            with open(vocal_path, "wb") as handle:
+                handle.write(b"VOX2")
+            with open(instrumental_path, "wb") as handle:
+                handle.write(b"INST")
+            return vocal_path
+
+        with _vocal_stubs(separate=fake_separate):
+            result = self._build()(_song())
+
+        # Melody was reused, but separation reran once, from the KEPT mix
+        # (no decode), purely to produce the missing instrumental.
+        self.assertEqual(len(separate_calls), 1)
+        self.assertTrue(separate_calls[0].endswith("instrumental.wav"))
+        self.assertEqual(result["report"]["melody"]["status"], "reused")
+        self.assertEqual(result["report"]["instrumental"]["status"], "ok")
+        self.assertTrue(self.store.exists(1, artifacts.KIND_INSTRUMENTAL))
+
+    def test_reuses_existing_instrumental(self):
+        self._seed_processed_song(with_instrumental=True)
+        boom = mock.Mock(side_effect=AssertionError("should not separate again"))
+        with _vocal_stubs(decode=boom, separate=boom):
+            result = self._build()(_song())
+        self.assertEqual(result["report"]["instrumental"]["status"], "reused")
+        self.assertIn("instrumental", {a["kind"] for a in result["artifacts"]})
+
+    def test_skipped_without_addon(self):
+        with _vocal_stubs(available=False):
+            result = self._build()(_song())
+        self.assertEqual(result["report"]["instrumental"]["status"], "skipped")
+        self.assertIn("add-on", result["report"]["instrumental"]["detail"])
+
+    def test_skipped_without_any_source_recording(self):
+        # No kept mix and no ytmusic id: nothing to separate from.
+        with _vocal_stubs():
+            result = self._build()(_song(ytmusic_video_id=None))
+        self.assertEqual(result["report"]["instrumental"]["status"], "skipped")
+
+    def test_separation_failure_is_best_effort(self):
+        self._seed_processed_song()
+        with _vocal_stubs(separate=mock.Mock(side_effect=RuntimeError("demucs blew up"))):
+            result = self._build()(_song())
+        self.assertEqual(result["report"]["instrumental"]["status"], "failed")
+        self.assertIn("demucs blew up", result["report"]["instrumental"]["detail"])
+        self.assertEqual(result["video_id"], "vid123")  # song still succeeds
+
+
 class ProcessingReportTestCase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -180,6 +281,7 @@ class ProcessingReportTestCase(unittest.TestCase):
         self.assertEqual(report["lyrics"]["status"], "ok")
         self.assertEqual(report["video"]["status"], "ok")
         self.assertEqual(report["melody"]["status"], "ok")
+        self.assertEqual(report["instrumental"]["status"], "ok")
         self.assertIn("1 synced lines from lrclib", report["lyrics"]["detail"])
         self.assertIn("notes from the isolated vocal", report["melody"]["detail"])
 
@@ -295,7 +397,10 @@ class StageRunsTestCase(unittest.TestCase):
         with _vocal_stubs():
             result = self._build()(_song())
         by_stage = {row["stage"]: row for row in result["stage_runs"]}
-        self.assertEqual(set(by_stage), {"lyrics", "video", "tempo", "melody"})
+        self.assertEqual(
+            set(by_stage),
+            {"lyrics", "video", "decode", "separate", "transcribe", "tempo", "melody", "instrumental"},
+        )
         for row in by_stage.values():
             self.assertGreaterEqual(row["finished_at"], row["started_at"])
             self.assertGreaterEqual(row["duration_ms"], 0)
@@ -314,7 +419,8 @@ class StageRunsTestCase(unittest.TestCase):
             artifacts.KIND_MELODY,
             {"notes": [{"start_ms": 0, "end_ms": 500, "midi": 60}], "source": "demucs+basic-pitch"},
         )
-        result = self._build()(_song())
+        with _vocal_stubs(available=False):
+            result = self._build()(_song())
         by_stage = {row["stage"]: row for row in result["stage_runs"]}
         self.assertEqual(by_stage["melody"]["status"], "reused")
         self.assertIsNotNone(by_stage["melody"]["output_hash"])

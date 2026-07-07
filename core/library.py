@@ -47,10 +47,20 @@ DEFAULT_DB_PATH = os.path.join(_REPO_ROOT, "library.db")
 # work enqueued by OTHER processes sharing the .db file.
 WORKER_POLL_SECONDS = 5.0
 
-# A song stuck in `processing` longer than this was orphaned by a crash /
-# restart mid-pipeline (the worker is single-threaded, so nothing legitimate
-# runs this long) - re-claim it as pending on the next poll.
-STALE_PROCESSING_SECONDS = 15 * 60
+# While a song is processing, a tiny side thread in the worker ticks
+# songs.heartbeat_at every HEARTBEAT_SECONDS. Staleness is judged from that
+# heartbeat, NOT from how long the claim has been held - a legitimately slow
+# stage (Demucs can run 10+ minutes on a NAS) keeps beating, while a killed
+# process stops instantly. This used to be a 15-minute claim-age horizon,
+# which left the queue dead for 15 minutes after any dev-reload/restart
+# mid-song.
+HEARTBEAT_SECONDS = 30
+STALE_PROCESSING_SECONDS = 150  # 5 missed heartbeats = the worker is gone
+
+# Queue priorities: user-picked songs (someone is waiting at the player)
+# jump ahead of chart-seeding backfill work.
+PRIORITY_USER = 1
+PRIORITY_BACKFILL = 0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS songs (
@@ -67,6 +77,9 @@ CREATE TABLE IF NOT EXISTS songs (
     lyrics_json TEXT,
     melody_json TEXT,
     report_json TEXT,
+    priority INTEGER NOT NULL DEFAULT 0,
+    heartbeat_at REAL,
+    current_stage TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE(artist COLLATE NOCASE, title COLLATE NOCASE)
@@ -112,6 +125,7 @@ _SUMMARY_FIELDS = (
     "status",
     "error",
     "video_id",
+    "current_stage",
     "created_at",
     "updated_at",
 )
@@ -154,11 +168,14 @@ class SongLibrary:
         self.work_available = threading.Event()
         with self._db() as conn:
             conn.executescript(_SCHEMA)
-            # Migration for DBs created before a column existed (CREATE TABLE
+            # Migrations for DBs created before a column existed (CREATE TABLE
             # IF NOT EXISTS never alters an existing table). Keeps an older
             # library.db usable across upgrades instead of silently missing
-            # the new column.
+            # the new columns.
             self._ensure_column(conn, "songs", "report_json", "TEXT")
+            self._ensure_column(conn, "songs", "priority", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "songs", "heartbeat_at", "REAL")
+            self._ensure_column(conn, "songs", "current_stage", "TEXT")
 
     @staticmethod
     def _ensure_column(conn, table, column, decl):
@@ -181,11 +198,22 @@ class SongLibrary:
 
     # -- enqueue / lookup ------------------------------------------------
 
-    def enqueue(self, artist, title, album=None, duration_seconds=None, cover_art="", ytmusic_video_id=None):
+    def enqueue(
+        self,
+        artist,
+        title,
+        album=None,
+        duration_seconds=None,
+        cover_art="",
+        ytmusic_video_id=None,
+        priority=PRIORITY_USER,
+    ):
         """Add a song to the processing queue, or return the existing row
         for this identity. A previously-failed song is reset to pending
         (sources change: lyrics get uploaded, videos appear), but ready and
-        in-flight songs are returned as-is rather than reprocessed."""
+        in-flight songs are returned as-is rather than reprocessed. A
+        user-priority enqueue of a song already pending at backfill priority
+        bumps it up the queue (someone is now waiting at the player)."""
         artist = (artist or "").strip()
         title = (title or "").strip()
         if not artist or not title:
@@ -200,19 +228,35 @@ class SongLibrary:
                 (artist, title),
             ).fetchone()
             if existing is not None and existing["status"] != STATUS_FAILED:
+                if existing["status"] == STATUS_PENDING and priority > existing["priority"]:
+                    conn.execute(
+                        "UPDATE songs SET priority = ?, updated_at = ? WHERE id = ?",
+                        (priority, now, existing["id"]),
+                    )
                 return self.summary(existing)
 
             if existing is not None:
                 conn.execute(
-                    "UPDATE songs SET status = ?, error = NULL, updated_at = ? WHERE id = ?",
-                    (STATUS_PENDING, now, existing["id"]),
+                    "UPDATE songs SET status = ?, error = NULL, priority = ?, updated_at = ? WHERE id = ?",
+                    (STATUS_PENDING, priority, now, existing["id"]),
                 )
                 song_id = existing["id"]
             else:
                 cursor = conn.execute(
                     "INSERT INTO songs (artist, title, album, duration_seconds, cover_art, ytmusic_video_id,"
-                    " status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (artist, title, album, duration_seconds, cover_art or "", ytmusic_video_id, STATUS_PENDING, now, now),
+                    " status, priority, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        artist,
+                        title,
+                        album,
+                        duration_seconds,
+                        cover_art or "",
+                        ytmusic_video_id,
+                        STATUS_PENDING,
+                        priority,
+                        now,
+                        now,
+                    ),
                 )
                 song_id = cursor.lastrowid
 
@@ -256,29 +300,51 @@ class SongLibrary:
     # -- queue mechanics ---------------------------------------------------
 
     def claim_next_pending(self):
-        """Atomically claim the oldest pending song for processing and
-        return its row as a dict, or None when the queue is empty. Also
-        rescues songs orphaned in `processing` by a crash (see
-        STALE_PROCESSING_SECONDS)."""
+        """Atomically claim the highest-priority (then oldest) pending song
+        for processing and return its row as a dict, or None when the queue
+        is empty. Also rescues songs orphaned in `processing` by a crash:
+        stale means the worker's heartbeat stopped (COALESCE covers rows
+        claimed by a pre-heartbeat version, judged by claim age instead)."""
         now = time.time()
         with self._db() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
-                "UPDATE songs SET status = ?, updated_at = ? WHERE status = ? AND updated_at < ?",
+                "UPDATE songs SET status = ?, current_stage = NULL, updated_at = ?"
+                " WHERE status = ? AND COALESCE(heartbeat_at, updated_at) < ?",
                 (STATUS_PENDING, now, STATUS_PROCESSING, now - STALE_PROCESSING_SECONDS),
             )
             row = conn.execute(
-                "SELECT * FROM songs WHERE status = ? ORDER BY id LIMIT 1", (STATUS_PENDING,)
+                "SELECT * FROM songs WHERE status = ? ORDER BY priority DESC, id LIMIT 1", (STATUS_PENDING,)
             ).fetchone()
             if row is None:
                 conn.execute("COMMIT")
                 return None
             conn.execute(
-                "UPDATE songs SET status = ?, updated_at = ? WHERE id = ?",
-                (STATUS_PROCESSING, now, row["id"]),
+                "UPDATE songs SET status = ?, heartbeat_at = ?, current_stage = NULL, updated_at = ? WHERE id = ?",
+                (STATUS_PROCESSING, now, now, row["id"]),
             )
             conn.execute("COMMIT")
         return dict(row)
+
+    def beat(self, song_id):
+        """Worker liveness tick for an in-flight song (see HEARTBEAT_SECONDS).
+        Guarded on status so a straggler beat after the song settled can't
+        resurrect bookkeeping on a ready/failed row."""
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE songs SET heartbeat_at = ? WHERE id = ? AND status = ?",
+                (time.time(), song_id, STATUS_PROCESSING),
+            )
+
+    def set_current_stage(self, song_id, stage):
+        """Record which pipeline stage an in-flight song is in, so the UI
+        can say 'processing - separate (2m10s)' instead of a bare
+        'processing'. Doubles as a heartbeat."""
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE songs SET current_stage = ?, heartbeat_at = ? WHERE id = ? AND status = ?",
+                (stage, time.time(), song_id, STATUS_PROCESSING),
+            )
 
     def mark_ready(
         self,
@@ -294,6 +360,7 @@ class SongLibrary:
         sets = [
             "status = ?",
             "error = NULL",
+            "current_stage = NULL",
             "video_id = ?",
             "lyrics_json = ?",
             "melody_json = ?",
@@ -346,7 +413,8 @@ class SongLibrary:
     def mark_failed(self, song_id, error, report=None):
         with self._db() as conn:
             conn.execute(
-                "UPDATE songs SET status = ?, error = ?, report_json = ?, updated_at = ? WHERE id = ?",
+                "UPDATE songs SET status = ?, error = ?, report_json = ?, current_stage = NULL, updated_at = ?"
+                " WHERE id = ?",
                 (STATUS_FAILED, str(error)[:500], json.dumps(report) if report else None, time.time(), song_id),
             )
 
@@ -357,32 +425,59 @@ class SongLibrary:
     # repeats across reprocessing runs, and no historical backfill is done -
     # the table starts empty, only runs from this feature forward appear here.
 
+    def record_stage_run(self, song_id, run_id, entry):
+        """Persist ONE stage's row the moment it finishes. The worker calls
+        this from the pipeline's observer hook, so lineage survives a crash
+        or restart mid-run instead of only landing at end-of-run."""
+        with self._db() as conn:
+            self._insert_stage_run(conn, song_id, run_id, entry)
+
     def record_stage_runs(self, song_id, run_id, stage_runs):
-        """Persist one run's stage_runs rows. No-op on an empty list, which
-        covers a bare crash before any stage completed - nothing to record."""
+        """Persist a batch of stage_runs rows. No-op on an empty list. Kept
+        for callers that run the pipeline without a live observer (e.g.
+        driving process() from a script)."""
         if not stage_runs:
             return
         with self._db() as conn:
             for entry in stage_runs:
-                conn.execute(
-                    "INSERT INTO stage_runs (song_id, run_id, stage, status, started_at, finished_at,"
-                    " duration_ms, input_hashes_json, output_path, output_hash, error, detail)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        song_id,
-                        run_id,
-                        entry["stage"],
-                        entry["status"],
-                        entry["started_at"],
-                        entry["finished_at"],
-                        entry.get("duration_ms"),
-                        json.dumps(entry["input_hashes"]) if entry.get("input_hashes") else None,
-                        entry.get("output_path"),
-                        entry.get("output_hash"),
-                        entry.get("error"),
-                        entry.get("detail"),
-                    ),
-                )
+                self._insert_stage_run(conn, song_id, run_id, entry)
+
+    @staticmethod
+    def _insert_stage_run(conn, song_id, run_id, entry):
+        conn.execute(
+            "INSERT INTO stage_runs (song_id, run_id, stage, status, started_at, finished_at,"
+            " duration_ms, input_hashes_json, output_path, output_hash, error, detail)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                song_id,
+                run_id,
+                entry["stage"],
+                entry["status"],
+                entry["started_at"],
+                entry["finished_at"],
+                entry.get("duration_ms"),
+                json.dumps(entry["input_hashes"]) if entry.get("input_hashes") else None,
+                entry.get("output_path"),
+                entry.get("output_hash"),
+                entry.get("error"),
+                entry.get("detail"),
+            ),
+        )
+
+    def stage_stats(self):
+        """Aggregate the stage_runs lineage into per-stage timing stats
+        (count/avg/max per stage+status) plus a songs-by-status census - the
+        'where does the time go' view, served by GET /library/stats."""
+        with self._db() as conn:
+            stage_rows = conn.execute(
+                "SELECT stage, status, COUNT(*) AS runs, CAST(AVG(duration_ms) AS INTEGER) AS avg_ms,"
+                " MAX(duration_ms) AS max_ms FROM stage_runs GROUP BY stage, status ORDER BY stage, status"
+            ).fetchall()
+            song_rows = conn.execute("SELECT status, COUNT(*) AS n FROM songs GROUP BY status").fetchall()
+        return {
+            "songs": {row["status"]: row["n"] for row in song_rows},
+            "stages": [dict(row) for row in stage_rows],
+        }
 
     def list_stage_runs(self, song_id):
         with self._db() as conn:
@@ -458,22 +553,50 @@ class LibraryWorker(threading.Thread):
 
     def _process_one(self, song):
         run_id = uuid.uuid4().hex
+        song_id = song["id"]
+
+        # Liveness ticker: beats every HEARTBEAT_SECONDS for as long as the
+        # pipeline runs, so claim_next_pending can tell a legitimately slow
+        # stage (still beating) from a dead worker (beat stopped) and rescue
+        # orphans in ~STALE_PROCESSING_SECONDS instead of minutes.
+        stop_beating = threading.Event()
+
+        def _keep_beating():
+            while not stop_beating.wait(HEARTBEAT_SECONDS):
+                self.library.beat(song_id)
+
+        beater = threading.Thread(name="library-worker-heartbeat", target=_keep_beating, daemon=True)
+        beater.start()
+
+        def observer(event, payload):
+            # The pipeline's live progress hook: stage begins update the
+            # row's current_stage (what the UI shows mid-flight), stage ends
+            # persist their stage_runs lineage row immediately - so a crash
+            # loses at most the in-flight stage, not the whole run's history.
+            # Best-effort: a bookkeeping hiccup must never fail the song.
+            try:
+                if event == "stage_begin":
+                    self.library.set_current_stage(song_id, payload)
+                elif event == "stage_end":
+                    self.library.record_stage_run(song_id, run_id, payload)
+            except Exception:
+                pass
+
         try:
-            result = self.process_song(song, run_id=run_id)
+            result = self.process_song(song, run_id=run_id, observer=observer)
         except ProcessingError as exc:
-            self.library.record_stage_runs(song["id"], run_id, getattr(exc, "stage_runs", None) or [])
-            self.library.mark_failed(song["id"], str(exc), report=getattr(exc, "report", None))
+            # Stage lineage (including the failed stage) was already
+            # persisted incrementally by the observer.
+            self.library.mark_failed(song_id, str(exc), report=getattr(exc, "report", None))
             return
         except Exception as exc:  # pipeline bug/infra failure - keep the worker alive
-            # No stage_runs to record here: an exception that isn't a
-            # ProcessingError means the pipeline crashed before any stage
-            # completed (or outside its stage bookkeeping entirely).
-            self.library.mark_failed(song["id"], f"unexpected error: {exc}")
+            self.library.mark_failed(song_id, f"unexpected error: {exc}")
             return
+        finally:
+            stop_beating.set()
 
-        self.library.record_stage_runs(song["id"], run_id, result.get("stage_runs") or [])
         self.library.mark_ready(
-            song["id"],
+            song_id,
             video_id=result["video_id"],
             lyrics=result["lyrics"],
             melody=result.get("melody"),

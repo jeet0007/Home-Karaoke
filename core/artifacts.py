@@ -23,13 +23,28 @@ import shutil
 # Artifact kinds. The value is the on-disk filename within the song dir.
 KIND_MIX = "mix"          # decoded full-mix audio (the "music" going in)
 KIND_VOCALS = "vocals"    # Demucs-separated vocal stem (the "singer audio")
+KIND_INSTRUMENTAL = "instrumental"  # mix minus vocals - the playable backing track
 KIND_LYRICS = "lyrics"    # synced lyrics
 KIND_MIDI = "midi"        # the melody as a Standard MIDI File
 KIND_MELODY = "melody"    # melody note segments (what the player/grader read)
 
+# All three audio artifacts are WAV, not a compressed format like FLAC,
+# despite the disk cost - deliberately. vocals/instrumental are re-seeked
+# up to 60x/second by the player's singer-assist resync loop (main.js's
+# per-frame syncLyrics -> singer-assist.js's syncTime(), which sets
+# <audio>.currentTime directly whenever the two independent audio elements
+# drift). WAV's time->byte mapping is exact and instant; a compressed
+# format needs the browser to decode toward a seek point, which is slower
+# and less precise - fine for occasional seeks, but this player's whole
+# purpose is tight sync, so repeated re-seeks on a compressed stream
+# reintroduced audible drift (regression caught 2026-07-07, one release
+# after trying FLAC here). Not worth revisiting without a fundamentally
+# different sync mechanism (e.g. Web Audio API buffer-based mixing instead
+# of two <audio> elements).
 FILENAMES = {
     KIND_MIX: "mix.wav",
     KIND_VOCALS: "vocals.wav",
+    KIND_INSTRUMENTAL: "instrumental.wav",
     KIND_LYRICS: "lyrics.json",
     KIND_MIDI: "melody.mid",
     KIND_MELODY: "melody.json",

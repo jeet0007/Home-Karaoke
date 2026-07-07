@@ -45,7 +45,34 @@ DEMUCS_SAMPLE_RATE_HZ = 44100
 # of the default 4-stem split and all we need. Overridable for hosts that
 # want a different/smaller model.
 DEMUCS_MODEL = os.environ.get("DEMUCS_MODEL", "htdemucs")
-DEMUCS_DEVICE = os.environ.get("DEMUCS_DEVICE", "cpu")
+# "auto" picks the fastest available torch backend (cuda > mps > cpu) -
+# Demucs on Apple-Silicon MPS or a CUDA GPU is several times faster than
+# CPU. Set DEMUCS_DEVICE explicitly to pin one (e.g. "cpu" on a NAS).
+DEMUCS_DEVICE = os.environ.get("DEMUCS_DEVICE", "auto")
+
+
+def _pick_device():
+    if DEMUCS_DEVICE != "auto":
+        return DEMUCS_DEVICE
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _cap_cpu_threads():
+    """Leave one core free so the web app (and the host - the target is a
+    small NAS that also does other jobs) stays responsive while Demucs
+    saturates the rest. KARAOKE_TORCH_THREADS overrides."""
+    import torch
+
+    override = os.environ.get("KARAOKE_TORCH_THREADS")
+    threads = int(override) if override else max(1, (os.cpu_count() or 2) - 1)
+    torch.set_num_threads(threads)
 
 # Notes shorter than this out of Basic Pitch are transcription flecks, not
 # sung notes - drop them (mirrors melody.MIN_NOTE_MS).
@@ -107,18 +134,42 @@ def _decode_to_wav(audio_url, out_path, timeout=120):
     return out_path
 
 
-def separate_vocals(input_wav_path, out_vocal_path):
+def separate_vocals(input_wav_path, out_vocal_path, out_instrumental_path=None):
     """Isolate the vocal stem from `input_wav_path` into `out_vocal_path`
-    (WAV) using Demucs. Lazy-imports torch/demucs; only called when
-    available() is True."""
-    from demucs.api import Separator, save_audio
+    (WAV) using Demucs. When `out_instrumental_path` is given, also save the
+    exact complement (mix minus vocals) - the playable karaoke backing
+    track, sample-aligned with the vocal stem by construction since both
+    come out of the same separation of the same file. Lazy-imports
+    torch/demucs; only called when available() is True."""
+    from demucs.api import save_audio
 
-    separator = Separator(model=DEMUCS_MODEL, device=DEMUCS_DEVICE)
-    _origin, stems = separator.separate_audio_file(input_wav_path)
+    device = _pick_device()
+    if device == "cpu":
+        _cap_cpu_threads()
+        origin, stems, samplerate = _separate(input_wav_path, device)
+    else:
+        try:
+            origin, stems, samplerate = _separate(input_wav_path, device)
+        except Exception:
+            # GPU/MPS backends can lack ops for a given model/torch combo -
+            # fall back to CPU rather than failing the song.
+            _cap_cpu_threads()
+            origin, stems, samplerate = _separate(input_wav_path, "cpu")
+
+    save_audio(stems["vocals"], out_vocal_path, samplerate=samplerate)
+    if out_instrumental_path:
+        save_audio(origin - stems["vocals"], out_instrumental_path, samplerate=samplerate)
+    return out_vocal_path
+
+
+def _separate(input_wav_path, device):
+    from demucs.api import Separator
+
+    separator = Separator(model=DEMUCS_MODEL, device=device)
+    origin, stems = separator.separate_audio_file(input_wav_path)
     if "vocals" not in stems:
         raise RuntimeError(f"Demucs model {DEMUCS_MODEL!r} produced no 'vocals' stem")
-    save_audio(stems["vocals"], out_vocal_path, samplerate=separator.samplerate)
-    return out_vocal_path
+    return origin, stems, separator.samplerate
 
 
 def transcribe(vocal_wav_path):

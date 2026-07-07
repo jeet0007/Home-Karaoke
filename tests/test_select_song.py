@@ -45,6 +45,14 @@ def _block_lrclib_fallback(test_case):
     library_patcher.start()
     test_case.addCleanup(library_patcher.stop)
 
+    # The live /select-song response cache is a plain module-level dict, not
+    # scoped per-library like the line above - many tests here reuse the
+    # same "Passenger"/"Let Her Go" identity with different mocked
+    # responses, so a stale cache entry from an earlier test would otherwise
+    # leak into a later one.
+    app_module._live_select_cache.clear()
+    test_case.addCleanup(app_module._live_select_cache.clear)
+
 
 class SelectSongRouteTestCase(unittest.TestCase):
     def setUp(self):

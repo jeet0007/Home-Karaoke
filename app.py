@@ -420,6 +420,42 @@ def _prewarm_stream_cache(video_id):
         pass
 
 
+# Stem artifacts moved from WAV to FLAC over time, and old rows keep their
+# recorded (WAV) paths - serve whichever extension the artifact actually is.
+_AUDIO_MIMETYPES = {".wav": "audio/wav", ".flac": "audio/flac", ".m4a": "audio/mp4"}
+
+
+def _audio_mimetype(path):
+    return _AUDIO_MIMETYPES.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+
+
+# Live /select-song responses, cached briefly per identity. While a song is
+# still processing in the background, every player load repeats the whole
+# metadata + lyrics + yt-dlp fan-out (5-15s) for an answer that can't have
+# changed. The library fast path is checked BEFORE this cache, so the moment
+# the song is ready the cache is naturally bypassed (and expires soon after).
+_LIVE_SELECT_TTL_S = 300
+_live_select_cache = {}
+_live_select_lock = threading.Lock()
+
+
+def _live_select_get(key):
+    with _live_select_lock:
+        entry = _live_select_cache.get(key)
+        if entry is None:
+            return None
+        expires_at, response = entry
+        if expires_at < time.time():
+            del _live_select_cache[key]
+            return None
+        return response
+
+
+def _live_select_put(key, response):
+    with _live_select_lock:
+        _live_select_cache[key] = (time.time() + _LIVE_SELECT_TTL_S, response)
+
+
 def _serve_library_song(payload):
     """/select-song fast path: everything was processed and stored by the
     library worker, so respond straight from the database - no ytmusicapi/
@@ -428,7 +464,13 @@ def _serve_library_song(payload):
 
     lyrics_result = payload.get("lyrics") or {}
     melody_result = payload.get("melody") or {}
-    has_singer_vocals = any(a["kind"] == artifacts.KIND_VOCALS for a in payload.get("artifacts") or [])
+    stored_kinds = {a["kind"] for a in payload.get("artifacts") or []}
+    has_singer_vocals = artifacts.KIND_VOCALS in stored_kinds
+    # A stored instrumental (original mix minus its vocal stem) means the
+    # player can run single-source: backing audio, lyrics, melody, and the
+    # singer-assist stem all on the original recording's timeline - no
+    # YouTube stream to resolve and no sync offset to correct.
+    has_instrumental = artifacts.KIND_INSTRUMENTAL in stored_kinds
     response = {
         "song_id": payload["id"],
         "artist": payload["artist"],
@@ -445,9 +487,13 @@ def _serve_library_song(payload):
         "video_id": video_id,
         "source": "library",
         "has_singer_vocals": has_singer_vocals,
+        "has_instrumental": has_instrumental,
     }
 
-    threading.Thread(target=_prewarm_stream_cache, args=(video_id,), daemon=True).start()
+    # Single-source playback never touches the YouTube stream, so warming
+    # its URL cache would be wasted yt-dlp work.
+    if not has_instrumental:
+        threading.Thread(target=_prewarm_stream_cache, args=(video_id,), daemon=True).start()
     return jsonify(response)
 
 
@@ -496,6 +542,13 @@ def select_song():
     library_hit = song_library.find_ready(artist, title)
     if library_hit and library_hit.get("video_id"):
         return _serve_library_song(library_hit)
+
+    # A repeat pick while the song is still processing serves the recent
+    # live answer instead of re-running the whole network fan-out.
+    cache_key = (artist.lower(), title.lower())
+    cached = _live_select_get(cache_key)
+    if cached is not None:
+        return jsonify(cached)
 
     query = f"{title} {artist}"
 
@@ -552,9 +605,11 @@ def select_song():
 
     if best is None:
         response["message"] = "No backing track found for this song."
+        _live_select_put(cache_key, response)
         return jsonify(response)
 
     response["video_id"] = best["video_id"]
+    _live_select_put(cache_key, response)
     threading.Thread(target=_prewarm_stream_cache, args=(best["video_id"],), daemon=True).start()
     return jsonify(response)
 
@@ -648,7 +703,31 @@ def library_song_vocals(song_id):
     artifact = song_library.get_artifact(song_id, artifacts.KIND_VOCALS)
     if artifact is None or not os.path.isfile(artifact["path"]):
         return jsonify({"error": "no singer vocal track available for this song"}), 404
-    return send_file(artifact["path"], mimetype="audio/wav")
+    # conditional=True serves HTTP Range requests - without it the <audio>
+    # element can't seek inside a large file without re-downloading it.
+    return send_file(artifact["path"], mimetype=_audio_mimetype(artifact["path"]), conditional=True)
+
+
+@app.route("/library/stats")
+def library_stats():
+    """Where the processing time goes: per-stage count/avg/max durations
+    aggregated from the stage_runs lineage, plus a songs-by-status census.
+    The 'is it getting slower' view without opening sqlite by hand."""
+    return jsonify(song_library.stage_stats())
+
+
+@app.route("/library/song/<int:song_id>/instrumental")
+def library_song_instrumental(song_id):
+    """Stream the instrumental backing track (the decoded original mix minus
+    its Demucs vocal stem). The player's preferred audio source: it shares
+    the original recording's timeline with the lyrics/melody/vocal stem, so
+    playing it needs no sync correction at all. Presentation only: serves a
+    stored artifact, never generates one - 404s for songs processed without
+    the ML add-on, and the player falls back to the karaoke video stream."""
+    artifact = song_library.get_artifact(song_id, artifacts.KIND_INSTRUMENTAL)
+    if artifact is None or not os.path.isfile(artifact["path"]):
+        return jsonify({"error": "no instrumental available for this song"}), 404
+    return send_file(artifact["path"], mimetype=_audio_mimetype(artifact["path"]), conditional=True)
 
 
 @app.route("/library/seed-charts", methods=["POST"])
@@ -681,6 +760,9 @@ def library_seed_charts():
                     duration_seconds=entry.get("duration_seconds"),
                     cover_art=entry.get("cover_art", ""),
                     ytmusic_video_id=entry.get("ytmusic_video_id"),
+                    # Backfill work: someone picking a song at the player
+                    # (PRIORITY_USER, the default) always jumps ahead of it.
+                    priority=library.PRIORITY_BACKFILL,
                 )
             )
         except ValueError:

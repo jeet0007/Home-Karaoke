@@ -29,6 +29,12 @@ class LibraryRouteTestCaseBase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+        # The live /select-song cache is a plain module-level dict, not
+        # scoped to song_library - clear it so a cached response from one
+        # test's identity can't leak into another's.
+        app_module._live_select_cache.clear()
+        self.addCleanup(app_module._live_select_cache.clear)
+
 
 class LibraryAddRouteTestCase(LibraryRouteTestCaseBase):
     def test_add_enqueues_pending_song(self):
@@ -150,6 +156,42 @@ class MidiDownloadRouteTestCase(LibraryRouteTestCaseBase):
         self.assertEqual(self.client.get(f"/library/song/{song['id']}/midi").status_code, 404)
 
 
+class InstrumentalRouteTestCase(LibraryRouteTestCaseBase):
+    def test_serves_stored_instrumental(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        wav_path = os.path.join(tmp.name, "instrumental.wav")
+        with open(wav_path, "wb") as handle:
+            handle.write(b"RIFFfake-wav-bytes")
+
+        song = self.library.enqueue("Passenger", "Let Her Go")
+        self.library.mark_ready(
+            song["id"],
+            video_id="vid",
+            lyrics=LYRICS,
+            artifacts=[{"kind": artifacts.KIND_INSTRUMENTAL, "path": wav_path, "bytes": os.path.getsize(wav_path)}],
+        )
+
+        resp = self.client.get(f"/library/song/{song['id']}/instrumental")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.mimetype, "audio/wav")
+        self.assertEqual(resp.data, b"RIFFfake-wav-bytes")
+
+    def test_404_when_no_instrumental_recorded(self):
+        song = self.library.enqueue("Passenger", "Let Her Go")
+        self.assertEqual(self.client.get(f"/library/song/{song['id']}/instrumental").status_code, 404)
+
+    def test_404_when_file_missing_on_disk(self):
+        song = self.library.enqueue("Passenger", "Let Her Go")
+        self.library.mark_ready(
+            song["id"],
+            video_id="vid",
+            lyrics=LYRICS,
+            artifacts=[{"kind": artifacts.KIND_INSTRUMENTAL, "path": "/nonexistent/instrumental.wav", "bytes": 10}],
+        )
+        self.assertEqual(self.client.get(f"/library/song/{song['id']}/instrumental").status_code, 404)
+
+
 class SeedChartsRouteTestCase(LibraryRouteTestCaseBase):
     def test_seeds_chart_songs_into_queue(self):
         chart_songs = [
@@ -200,6 +242,28 @@ class SelectSongLibraryFastPathTestCase(LibraryRouteTestCaseBase):
         self.assertEqual(data["lyrics"]["synced"], LYRICS["synced"])
         self.assertEqual(data["melody"], MELODY["notes"])
         self.assertEqual(data["cover_art"], "http://art")
+        self.assertFalse(data["has_instrumental"])  # no stored stem: video fallback
+        mock_karaoke_search.assert_not_called()
+
+    @patch("app.karaoke_search.search")
+    def test_instrumental_song_flags_single_source_and_skips_prewarm(self, mock_karaoke_search):
+        song = self.library.enqueue("Passenger", "Let Her Go", duration_seconds=253)
+        self.library.mark_ready(
+            song["id"],
+            video_id="vid123",
+            lyrics=LYRICS,
+            melody=MELODY,
+            artifacts=[{"kind": artifacts.KIND_INSTRUMENTAL, "path": "/data/1/instrumental.wav", "bytes": 4}],
+        )
+
+        with patch.object(app_module, "_prewarm_stream_cache") as prewarm:
+            resp = self.client.get("/select-song?artist=Passenger&title=Let+Her+Go")
+
+        data = resp.get_json()
+        self.assertTrue(data["has_instrumental"])
+        # Single-source playback never touches the YouTube stream, so no
+        # yt-dlp cache warm should be spent on it.
+        prewarm.assert_not_called()
         mock_karaoke_search.assert_not_called()
 
     @patch("app.karaoke_search.search")

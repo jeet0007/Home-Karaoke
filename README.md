@@ -79,15 +79,17 @@ instead of being thrown away in a tempdir, so each stage is independently re-run
 | artifact | file | reused for |
 |---|---|---|
 | decoded mix | `mix.wav` | re-separating vocals without re-downloading |
-| vocal stem | `vocals.wav` | re-transcribing without re-running Demucs |
+| vocal stem | `vocals.wav` | re-transcribing without re-running Demucs; singer-assist track |
+| instrumental | `instrumental.wav` | the player's preferred backing track (single-source playback) |
 | lyrics | `lyrics.json` | — |
 | melody | `melody.json` | the player note guide + grading |
 | MIDI | `melody.mid` | portable/downloadable transcription (`GET /library/song/<id>/midi`) |
 
 Each pipeline stage skips when its artifact already exists — delete just `melody.mid` and the next
 run regenerates it from the kept vocal stem; delete `vocals.wav` too and it re-separates from the
-kept mix. Artifact paths are tracked in the library DB (`artifacts` table). Note: `mix.wav` +
-`vocals.wav` are large — point `KARAOKE_DATA_DIR` at a roomy NAS volume.
+kept mix. Artifact paths are tracked in the library DB (`artifacts` table). Note: the WAVs
+(`mix.wav`, `vocals.wav`, `instrumental.wav`) are large — point `KARAOKE_DATA_DIR` at a roomy NAS
+volume.
 
 ## Song library & processing queue
 
@@ -105,12 +107,22 @@ POST /library/add            → {"artist", "title", "duration_seconds"?, "ytmus
 GET  /library/song/<id>      → full stored payload (lyrics/melody + artifact paths + processing report)
 GET  /library/song/<id>/midi → download the transcribed melody as a Standard MIDI File
 GET  /library/song/<id>/vocals → stream the isolated vocal stem for the singer-assist toggle
+GET  /library/song/<id>/instrumental → stream the separated backing track (single-source playback)
+GET  /library/stats          → per-stage timing (count/avg/max duration_ms) + songs-by-status counts
 POST /library/seed-charts    → {"limit": 20, "country": "ZZ"} — enqueue the current YouTube Music top
                                charts so the library builds itself over time (run occasionally/cron)
 ```
 
 The search page shows the library under the search box: ready songs play instantly, in-flight rows
-show worker progress (auto-refreshing), failed rows say why. Re-adding a failed song retries it.
+show worker progress (auto-refreshing, including which pipeline stage is running — "processing ·
+separate"), failed rows say why. Re-adding a failed song retries it. Picking a song at the player
+jumps it ahead of any `seed-charts` backfill work still queued behind it (priority queue: user picks
+always claim before backfill, FIFO within the same priority).
+
+The worker keeps a heartbeat while a song is in flight, so a song orphaned by a crash or restart —
+not a slow stage, which keeps beating — is reclaimed in under 3 minutes instead of sitting dead in
+the queue. `GET /library/stats` aggregates the stage-timing lineage below into per-stage count/avg/max
+duration plus a songs-by-status count — a quick "where's the time going, is it getting slower" view.
 
 ### Per-song processing report (what passed / what failed)
 
@@ -132,7 +144,17 @@ leave no trace.
 
 Every stage run is also appended to a `stage_runs` lineage table (survives reprocessing, unlike the
 report above which is overwritten each run) and logged as structured JSON to `KARAOKE_LOG_DIR`
-(default `./logs/`) — see CLAUDE.md for the schema.
+(default `./logs/`) — see CLAUDE.md for the schema. Each row is persisted the moment its stage
+finishes (not batched at the end of the run), so a crash mid-song loses at most the one in-flight
+stage's row. The melody stage's slow inner steps (decode, Demucs separation, Basic Pitch transcription)
+get their own lineage rows too, so a multi-minute run is attributable instead of one opaque blob —
+`GET /library/stats` is the fastest way to see this.
+
+**Speeding up Demucs.** `DEMUCS_DEVICE` defaults to `auto`: it picks CUDA, then Apple Silicon MPS,
+then CPU, and falls back to CPU if a GPU/MPS separation errors — several times faster than CPU when a
+GPU or Apple Silicon is available. Pin one explicitly (e.g. `DEMUCS_DEVICE=cpu`) on a NAS with no
+accelerator; `KARAOKE_TORCH_THREADS` caps CPU thread count (default: all cores minus one) so
+separation doesn't starve the rest of the host.
 
 ## Note guide & melody scoring
 
@@ -173,13 +195,21 @@ for songs with a processed stem; its volume slider only shows while the toggle i
 loudness — there's no on-screen master-volume control, since this targets a TV (remote) or device
 that already has its own hardware/OS volume.
 
-### Lyric sync offset
+### Single-source playback & lyric sync
 
-Lyrics and the note guide are timed to the *original* recording, but playback is a *different*
-karaoke backing track whose intro can be a different length — so they can drift (e.g. the lyrics
-start singing while the backing track's intro is still playing). The player has a **Sync** control
-(the `[` / `]` keys, or the "Lyrics -/+" buttons) that nudges the lyric/melody timeline against the
-audio; the offset is remembered per backing track in `localStorage`.
+Once the ML add-on has processed a song, the player's backing track is the *original recording's own
+instrumental* — the decoded mix minus its Demucs vocal stem (`instrumental.wav`, the same separation
+that produces the singer-assist stem, served at `GET /library/song/<id>/instrumental`). Backing
+audio, lyrics, note guide, and the singer-assist vocal then all come from **one** recording (indeed
+one separation of one file), so they are in sync by construction: nothing to correct, and the Sync
+control is hidden.
+
+Songs not yet processed (or processed without the ML add-on) fall back to streaming the auto-picked
+karaoke video's audio. That's a *different* upload whose intro can be a different length than the
+recording the lyrics were timed to, so they can drift (e.g. the lyrics start singing while the
+backing track's intro is still playing). In fallback mode the player keeps its **Sync** control (the
+`[` / `]` keys, or the "Lyrics -/+" buttons) to nudge the lyric/melody timeline against the audio;
+the offset is remembered per backing track in `localStorage`.
 
 ## Lyrics
 

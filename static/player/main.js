@@ -21,8 +21,8 @@ import {
   drawNoteGuide,
 } from './note-guide.js';
 import { ensureGradingStarted, stopGrading, sendPositionSync } from './grading.js';
-import { enableControls, setPlayButton, togglePlayback, restartPlayback, loadStream } from './playback.js';
-import { setupSingerAssist } from './singer-assist.js';
+import { enableControls, setPlayButton, togglePlayback, restartPlayback, loadStream, loadLocalTrack } from './playback.js';
+import { setupSingerAssist, resync as resyncSingerAssist } from './singer-assist.js';
 
 const { title: songTitle, artist, duration: durationHint, ytmusicVideoId } = window.PLAYER_CONFIG;
 
@@ -33,8 +33,17 @@ const playPauseBtn = document.getElementById('play-pause');
 const restartBtn = document.getElementById('restart');
 const syncEarlierBtn = document.getElementById('sync-earlier');
 const syncLaterBtn = document.getElementById('sync-later');
+const syncGroup = document.querySelector('.sync-group');
 
 let animationFrameId = null;
+
+// True when the backing audio is the library's instrumental artifact (the
+// original recording minus its Demucs vocal stem). In that mode the audio,
+// lyrics, note guide, and singer-assist stem all live on the original
+// recording's timeline - in sync by construction - so the whole sync-offset
+// mechanism (a correction for playing a DIFFERENT karaoke upload) is moot
+// and its controls are hidden and inert.
+let singleSource = false;
 
 // Layer 1 of the player background: the song's own YouTube thumbnail,
 // blurred full-bleed behind the lyrics/note-guide (see the .art-background
@@ -55,16 +64,21 @@ function setArtBackground(videoId) {
 // grader's song-position clock both need to be re-placed immediately
 // instead of waiting for the next animation frame / sync tick.
 function handleSyncAdjust(deltaMs) {
+  if (singleSource) return;
   adjustSyncOffset(deltaMs);
   resyncLyrics(effectiveLyricMs());
+  resyncSingerAssist();
   sendPositionSync();
 }
 
 function syncLyrics() {
-  // Lyrics + note guide follow the (offset-adjusted) lyric timeline.
+  // Lyrics + note guide follow the (offset-adjusted) lyric timeline; the
+  // singer-assist track re-anchors to the same timeline here too, so it
+  // can't silently drift over a long song between discrete play/seek events.
   const lyricMs = effectiveLyricMs();
   updateCurrentLyric(lyricMs);
   drawNoteGuide(lyricMs);
+  resyncSingerAssist();
   animationFrameId = requestAnimationFrame(syncLyrics);
 }
 
@@ -111,14 +125,27 @@ async function loadSong() {
       setTimeout(() => retryLyricsOnce(artist, songTitle, durationHint), LYRICS_RETRY_DELAY_MS);
     }
 
+    singleSource = Boolean(data.has_instrumental);
+    syncGroup.hidden = singleSource;
+    setArtBackground(data.video_id);
+
+    if (singleSource) {
+      // Preferred path: play the original recording's own instrumental
+      // (see the singleSource comment above). The offset stays 0 - a saved
+      // per-video nudge belongs to the karaoke-upload fallback, not here.
+      loadSyncOffset(null);
+      loadLocalTrack(`/library/song/${data.song_id}/instrumental`);
+      return;
+    }
+
     if (!data.video_id) {
       setOverlayNoBackingTrack(data.message || 'No backing track found for this song.');
       return;
     }
 
-    // Restore any sync nudge saved for this backing track on a past visit.
+    // Fallback: stream the picked karaoke upload's audio. Restore any sync
+    // nudge saved for this backing track on a past visit.
     loadSyncOffset(data.video_id);
-    setArtBackground(data.video_id);
     await loadStream(data.video_id);
   } catch (err) {
     setOverlayError('Network error — is the server running?');

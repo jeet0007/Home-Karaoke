@@ -40,6 +40,13 @@ function renderLibraryRow(song) {
   if (song.status === 'failed' && song.error) metaParts.push(song.error);
   const meta = metaParts.filter(Boolean).join(' · ');
   const thumb = song.cover_art || '';
+  // Mid-flight rows say WHICH pipeline stage is running (the worker keeps
+  // songs.current_stage fresh), so a 2-minute Demucs run reads as
+  // "processing · separate" instead of an opaque "processing".
+  const chipText =
+    song.status === 'processing' && song.current_stage
+      ? `processing · ${song.current_stage}`
+      : song.status;
   return `
     <div class="song-row${playable ? '' : ' not-playable'}" data-playable="${playable ? '1' : ''}" data-artist="${escapeHtml(song.artist)}" data-title="${escapeHtml(song.title)}" data-duration="${song.duration_seconds != null ? song.duration_seconds : ''}">
       ${thumb ? `<img class="song-thumb" src="${escapeHtml(thumb)}" loading="lazy" alt="">` : ''}
@@ -48,7 +55,7 @@ function renderLibraryRow(song) {
         ${meta ? `<div class="song-meta">${escapeHtml(meta)}</div>` : ''}
         ${renderStageBadges(song.stages)}
       </div>
-      <span class="status-chip ${escapeHtml(song.status)}">${escapeHtml(song.status)}</span>
+      <span class="status-chip ${escapeHtml(song.status)}">${escapeHtml(chipText)}</span>
     </div>
   `;
 }

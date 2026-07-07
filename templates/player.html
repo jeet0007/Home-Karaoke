@@ -252,6 +252,13 @@
     gap: 0.4rem;
   }
 
+  /* Hidden by main.js in single-source mode (backing audio is the original
+     recording's own instrumental, so there is no cross-video drift to
+     correct) - the [hidden] attribute alone loses to `display: flex`. */
+  .sync-group[hidden] {
+    display: none;
+  }
+
   .sync-group button {
     min-width: 4.25rem;
   }
@@ -457,7 +464,9 @@
     <!-- Nudge the lyrics/note-guide timeline against the backing track: the
          karaoke video's intro can be a different length than the recording
          the lyrics were timed to, so they drift. This shifts them back into
-         sync ([ / ] keys), remembered per song. -->
+         sync ([ / ] keys), remembered per song. Only relevant to the
+         karaoke-video fallback - hidden when the song plays its own
+         separated instrumental (single-source mode, nothing to correct). -->
     <div class="sync-group" aria-label="Lyric sync">
       <button id="sync-earlier" type="button" title="Lyrics earlier ([)">Lyrics -</button>
       <span id="sync-display" class="sync-display" title="Lyric timing offset">Sync 0.0s</span>

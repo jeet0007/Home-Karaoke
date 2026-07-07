@@ -56,6 +56,16 @@ export async function restartPlayback() {
   setPlayButton();
 }
 
+// Single-source mode: the backing track is a library artifact (the
+// original recording's instrumental), served by this app - nothing to
+// resolve, no expiring upstream URL.
+export function loadLocalTrack(url) {
+  audio.src = url;
+  audio.load();
+  hideOverlay();
+  enableControls();
+}
+
 export async function loadStream(videoId) {
   setOverlayLoading('Resolving the playable stream...');
 

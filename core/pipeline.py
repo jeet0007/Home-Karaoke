@@ -3,9 +3,11 @@
 This module is the ENGINE. Given a song identity it produces the reusable
 artifacts a karaoke session needs and persists each to the ArtifactStore:
 
-    lyrics   -> synced lyric lines
-    vocals   -> isolated vocal stem (only when the ML deps are installed)
-    melody   -> note segments + a real .mid file (the "music -> MIDI" output)
+    lyrics       -> synced lyric lines
+    vocals       -> isolated vocal stem (only when the ML deps are installed)
+    instrumental -> mix minus vocals: the playable backing track, on the
+                    same timeline as everything above by construction
+    melody       -> note segments + a real .mid file (the "music -> MIDI" output)
 
 The melody is produced ONLY from the isolated vocal (Demucs -> Basic Pitch).
 There is deliberately no full-mix fallback: transcribing the dominant pitch
@@ -94,29 +96,52 @@ class RunContext:
     `report` is unchanged (still what songs.report_json stores). `stage_runs`
     is new: one entry per _stage() call, with timing + content hashes, for
     the stage_runs table (persisted by library.py - this module has no idea
-    that table exists)."""
+    that table exists).
 
-    __slots__ = ("run_id", "song_id", "report", "stage_runs")
+    `observer` is an optional live-progress hook: observer("stage_begin",
+    stage_name) as each stage starts, observer("stage_end", stage_run_entry)
+    as each finishes. The worker uses it to show the in-flight stage and to
+    persist lineage incrementally (crash-proof); pipeline tests and direct
+    callers just leave it None. Observer errors are swallowed - telemetry
+    must never fail a song."""
 
-    def __init__(self, run_id, song_id):
+    __slots__ = ("run_id", "song_id", "report", "stage_runs", "observer")
+
+    def __init__(self, run_id, song_id, observer=None):
         self.run_id = run_id
         self.song_id = song_id
         self.report = {}
         self.stage_runs = []
+        self.observer = observer
+
+    def notify(self, event, payload):
+        if self.observer is None:
+            return
+        try:
+            self.observer(event, payload)
+        except Exception:
+            pass
+
+    def begin(self, stage):
+        self.notify("stage_begin", stage)
 
 
-def _stage(ctx, name, status, detail, *, started_at=None, input_hashes=None, output_path=None, output_hash=None):
+def _stage(ctx, name, status, detail, *, started_at=None, input_hashes=None, output_path=None, output_hash=None, in_report=True):
     """Record one stage's outcome. status is ok/reused/skipped/failed; detail
     is a short human-readable explanation of what passed / why it didn't.
 
-    Populates both ctx.report (unchanged shape/consumer) and ctx.stage_runs
-    (new: timing + content-hash lineage), and logs one line per call - INFO,
-    or ERROR when status is "failed"."""
+    Populates ctx.report (unchanged shape/consumer) and ctx.stage_runs
+    (timing + content-hash lineage), logs one line per call - INFO, or ERROR
+    when status is "failed" - and notifies ctx's observer so the worker can
+    persist the row immediately. in_report=False keeps a sub-stage (decode/
+    separate/transcribe) out of the UI-facing report - its umbrella stage
+    (melody) summarizes there - while still recording full lineage."""
     finished_at = time.time()
     started_at = finished_at if started_at is None else started_at
     duration_ms = int(round((finished_at - started_at) * 1000))
 
-    ctx.report[name] = {"status": status, "detail": detail}
+    if in_report:
+        ctx.report[name] = {"status": status, "detail": detail}
     ctx.stage_runs.append(
         {
             "stage": name,
@@ -131,6 +156,7 @@ def _stage(ctx, name, status, detail, *, started_at=None, input_hashes=None, out
             "detail": detail,
         }
     )
+    ctx.notify("stage_end", ctx.stage_runs[-1])
 
     _logger.log(
         logging.ERROR if status == "failed" else logging.INFO,
@@ -150,6 +176,7 @@ def _stage(ctx, name, status, detail, *, started_at=None, input_hashes=None, out
 
 def _stage_lyrics(song, store, produced, fetch_lyrics, ctx):
     started_at = time.time()
+    ctx.begin("lyrics")
     lyrics = fetch_lyrics(song["artist"], song["title"], song["duration_seconds"])
     if not lyrics or not lyrics.get("synced"):
         _stage(ctx, "lyrics", "failed", "no synced lyrics found in any source", started_at=started_at)
@@ -170,6 +197,7 @@ def _stage_lyrics(song, store, produced, fetch_lyrics, ctx):
 
 def _stage_video(song, find_video, ctx):
     started_at = time.time()
+    ctx.begin("video")
     video = find_video(song["artist"], song["title"], song["duration_seconds"])
     if not video or not video.get("video_id"):
         _stage(ctx, "video", "failed", "no karaoke backing track found", started_at=started_at)
@@ -183,6 +211,7 @@ def _estimate_tempo(store, song_id, ctx):
     mix drives the beat, so tempo is estimated from it, not the vocal. Every
     outcome is recorded on ctx; returns the BPM or None."""
     started_at = time.time()
+    ctx.begin("tempo")
     if not tempo.available():
         _stage(ctx, "tempo", "skipped", "tempo add-on (librosa) not installed", started_at=started_at)
         return None
@@ -204,22 +233,94 @@ def _estimate_tempo(store, song_id, ctx):
     return bpm
 
 
+def _substage_decode(song, store, produced, resolve_audio_url, ctx):
+    """Resolve the original recording's stream URL and decode it to the mix
+    WAV. Lineage-only sub-stage (in_report=False): the melody stage
+    summarizes for the UI; this row makes the minutes attributable."""
+    song_id = song["id"]
+    started_at = time.time()
+    ctx.begin("decode")
+    mix_path = store.path(song_id, artifacts.KIND_MIX)
+    if store.exists(song_id, artifacts.KIND_MIX):
+        _stage(
+            ctx, "decode", "reused", "reused decoded mix from a previous run",
+            started_at=started_at, output_path=mix_path,
+            output_hash=store.content_hash(song_id, artifacts.KIND_MIX), in_report=False,
+        )
+        return mix_path
+    try:
+        vocal_transcribe._decode_to_wav(resolve_audio_url(song["ytmusic_video_id"]), mix_path)
+    except Exception as exc:
+        _stage(ctx, "decode", "failed", f"stream resolve/decode failed: {exc}", started_at=started_at, in_report=False)
+        raise
+    _record(produced, store, song_id, artifacts.KIND_MIX)
+    _stage(
+        ctx, "decode", "ok", "resolved + decoded the original recording",
+        started_at=started_at, output_path=mix_path,
+        output_hash=store.content_hash(song_id, artifacts.KIND_MIX), in_report=False,
+    )
+    return mix_path
+
+
+def _substage_separate(song_id, mix_path, vocal_path, store, produced, ctx):
+    """Demucs separation - by far the slowest step, so it gets its own
+    stage_runs row and current_stage window instead of hiding inside a
+    silent multi-minute melody blob."""
+    started_at = time.time()
+    ctx.begin("separate")
+    input_hashes = [store.content_hash(song_id, artifacts.KIND_MIX)]
+    try:
+        # One Demucs pass yields both stems: the vocal (transcribed next,
+        # and the singer-assist track) and the instrumental (the playable
+        # backing track - recorded by _stage_instrumental, which owns its
+        # bookkeeping).
+        vocal_transcribe.separate_vocals(mix_path, vocal_path, store.path(song_id, artifacts.KIND_INSTRUMENTAL))
+    except Exception as exc:
+        _stage(
+            ctx, "separate", "failed", f"vocal separation failed: {exc}",
+            started_at=started_at, input_hashes=input_hashes, in_report=False,
+        )
+        raise
+    _record(produced, store, song_id, artifacts.KIND_VOCALS)
+    _stage(
+        ctx, "separate", "ok", "Demucs split the mix into vocal + instrumental stems",
+        started_at=started_at, input_hashes=input_hashes, output_path=vocal_path,
+        output_hash=store.content_hash(song_id, artifacts.KIND_VOCALS), in_report=False,
+    )
+
+
+def _substage_transcribe(song_id, vocal_path, store, ctx):
+    started_at = time.time()
+    ctx.begin("transcribe")
+    input_hashes = [store.content_hash(song_id, artifacts.KIND_VOCALS)]
+    try:
+        segments = vocal_transcribe.note_events_to_segments(vocal_transcribe.transcribe(vocal_path))
+    except Exception as exc:
+        _stage(
+            ctx, "transcribe", "failed", f"transcription failed: {exc}",
+            started_at=started_at, input_hashes=input_hashes, in_report=False,
+        )
+        raise
+    _stage(
+        ctx, "transcribe", "ok", f"Basic Pitch produced {len(segments)} note segments",
+        started_at=started_at, input_hashes=input_hashes, in_report=False,
+    )
+    return segments
+
+
 def _build_vocal_melody(song, store, produced, resolve_audio_url, ctx):
     """Isolated-vocal path: keep the mix and the vocal stem as artifacts so
-    either can be reused. Each sub-step is skipped when its file already
-    exists."""
+    either can be reused. Each sub-step (decode/separate/transcribe) is its
+    own observable sub-stage, skipped when its file already exists; failures
+    propagate to _stage_melody, which reports the umbrella outcome."""
     song_id = song["id"]
     vocal_path = store.path(song_id, artifacts.KIND_VOCALS)
 
     if not store.exists(song_id, artifacts.KIND_VOCALS):
-        mix_path = store.path(song_id, artifacts.KIND_MIX)
-        if not store.exists(song_id, artifacts.KIND_MIX):
-            vocal_transcribe._decode_to_wav(resolve_audio_url(song["ytmusic_video_id"]), mix_path)
-            _record(produced, store, song_id, artifacts.KIND_MIX)
-        vocal_transcribe.separate_vocals(mix_path, vocal_path)
-        _record(produced, store, song_id, artifacts.KIND_VOCALS)
+        mix_path = _substage_decode(song, store, produced, resolve_audio_url, ctx)
+        _substage_separate(song_id, mix_path, vocal_path, store, produced, ctx)
 
-    segments = vocal_transcribe.note_events_to_segments(vocal_transcribe.transcribe(vocal_path))
+    segments = _substage_transcribe(song_id, vocal_path, store, ctx)
     duration_s = max((n["end_ms"] for n in segments), default=0) / 1000.0
     bpm = _estimate_tempo(store, song_id, ctx)
     return {"notes": segments, "duration_s": duration_s, "source": "demucs+basic-pitch", "bpm": bpm}
@@ -234,6 +335,7 @@ def _stage_melody(song, lyrics, store, produced, resolve_audio_url, ctx):
     is recorded on ctx so it's inspectable per song."""
     song_id = song["id"]
     started_at = time.time()
+    ctx.begin("melody")
     if store.exists(song_id, artifacts.KIND_MELODY):
         # Already transcribed on a previous run - reuse, and make sure the
         # MIDI exists too (it may have been deleted to force regeneration).
@@ -302,6 +404,89 @@ def _stage_melody(song, lyrics, store, produced, resolve_audio_url, ctx):
     return result
 
 
+def _stage_instrumental(song, store, produced, resolve_audio_url, ctx):
+    """Make sure the song has a playable instrumental (the decoded original
+    mix minus its Demucs vocal stem). This is THE backing track the player
+    prefers: it comes from the same recording (indeed the same separation of
+    the same file) the lyrics, melody, and singer-assist stem are timed to,
+    so everything is in sync by construction - no cross-video offset to
+    correct. Best-effort like melody: without it the player falls back to
+    streaming the picked karaoke video, with its manual sync trim.
+
+    A fresh melody run already wrote the instrumental during separation (see
+    _build_vocal_melody) - this stage then just records it. For songs
+    processed before the instrumental existed (melody reused, stem absent),
+    it re-separates from the kept mix, re-decoding the mix first if that was
+    cleaned up too."""
+    song_id = song["id"]
+    started_at = time.time()
+    ctx.begin("instrumental")
+
+    if store.exists(song_id, artifacts.KIND_INSTRUMENTAL):
+        # Written this run alongside the vocal stem (a fresh KIND_VOCALS in
+        # `produced` is the tell), or kept from a previous run.
+        fresh = any(entry["kind"] == artifacts.KIND_VOCALS for entry in produced)
+        _record(produced, store, song_id, artifacts.KIND_INSTRUMENTAL)
+        _stage(
+            ctx,
+            "instrumental",
+            "ok" if fresh else "reused",
+            "separated alongside the vocal stem" if fresh else "reused instrumental from a previous run",
+            started_at=started_at,
+            output_path=store.path(song_id, artifacts.KIND_INSTRUMENTAL),
+            output_hash=store.content_hash(song_id, artifacts.KIND_INSTRUMENTAL),
+        )
+        return
+
+    if not vocal_transcribe.available():
+        _stage(
+            ctx,
+            "instrumental",
+            "skipped",
+            "vocal-separation add-on (Demucs) not installed",
+            started_at=started_at,
+        )
+        return
+    if not store.exists(song_id, artifacts.KIND_MIX) and not song.get("ytmusic_video_id"):
+        _stage(ctx, "instrumental", "skipped", "no source recording to separate from", started_at=started_at)
+        return
+
+    try:
+        mix_path = store.path(song_id, artifacts.KIND_MIX)
+        if not store.exists(song_id, artifacts.KIND_MIX):
+            vocal_transcribe._decode_to_wav(resolve_audio_url(song["ytmusic_video_id"]), mix_path)
+            _record(produced, store, song_id, artifacts.KIND_MIX)
+        vocal_transcribe.separate_vocals(
+            mix_path,
+            store.path(song_id, artifacts.KIND_VOCALS),
+            store.path(song_id, artifacts.KIND_INSTRUMENTAL),
+        )
+    except Exception as exc:
+        _stage(
+            ctx,
+            "instrumental",
+            "failed",
+            f"vocal separation failed: {exc}",
+            started_at=started_at,
+            input_hashes=[store.content_hash(song_id, artifacts.KIND_MIX)],
+        )
+        return
+
+    # The vocal stem was refreshed as a side product of the same separation.
+    _record(produced, store, song_id, artifacts.KIND_VOCALS)
+    _record(produced, store, song_id, artifacts.KIND_INSTRUMENTAL)
+    _stage(
+        ctx,
+        "instrumental",
+        "ok",
+        "separated the instrumental from the original recording",
+        started_at=started_at,
+        input_hashes=[store.content_hash(song_id, artifacts.KIND_MIX)],
+        output_path=store.path(song_id, artifacts.KIND_INSTRUMENTAL),
+        output_hash=store.content_hash(song_id, artifacts.KIND_INSTRUMENTAL),
+    )
+
+
 def _melody_midi_bytes(result):
     """Serialize a melody result to MIDI bytes at its estimated tempo (or the
     nominal default when no BPM was determined)."""
@@ -328,16 +513,19 @@ def build_processor(store, *, fetch_lyrics, find_video, resolve_audio_url):
     `run_id` identifies this processing attempt for lineage/log correlation.
     LibraryWorker._process_one always supplies one (uuid4 hex); callers that
     invoke process() directly (every existing pipeline test) get one
-    generated here so they don't have to care.
+    generated here so they don't have to care. `observer` is the optional
+    live-progress hook threaded onto RunContext (see its docstring); the
+    worker supplies one, tests/CLI callers may not.
     """
 
-    def process(song, run_id=None):
+    def process(song, run_id=None, observer=None):
         run_id = run_id or uuid.uuid4().hex
-        ctx = RunContext(run_id, song["id"])
+        ctx = RunContext(run_id, song["id"], observer=observer)
         produced = []
         lyrics = _stage_lyrics(song, store, produced, fetch_lyrics, ctx)
         video = _stage_video(song, find_video, ctx)
         melody_result = _stage_melody(song, lyrics, store, produced, resolve_audio_url, ctx)
+        _stage_instrumental(song, store, produced, resolve_audio_url, ctx)
 
         return {
             "lyrics": lyrics,
