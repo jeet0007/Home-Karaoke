@@ -293,6 +293,47 @@ class SelectSongLibraryFastPathTestCase(LibraryRouteTestCaseBase):
         full = self.library.get_full(rows[0]["id"])
         self.assertEqual(full["status"], "pending")
 
+    @patch("app.karaoke_search.search")
+    @patch("app.lyrica_client.get_lyrics_full")
+    @patch("app.lyrica_client.get_metadata")
+    def test_live_path_prefills_resolved_lyrics_and_video_for_the_background_run(
+        self, mock_metadata, mock_lyrics, mock_karaoke_search
+    ):
+        # The live pick already resolved lyrics + a video for this identity
+        # - the queued row should carry them so the background pipeline
+        # doesn't repeat the same Lyrica/yt-dlp lookups a second time.
+        mock_metadata.return_value = {"cover_art": "http://art", "duration_s": 253}
+        mock_lyrics.return_value = dict(LYRICS)
+        mock_karaoke_search.return_value = [{"video_id": "aaa", "score": 20, "duration_seconds": 253}]
+
+        with patch("lyrics.lrclib_client.get_lyrics_full", return_value=None):
+            self.client.get("/select-song?artist=Passenger&title=Let+Her+Go&ytmusic_video_id=ytm42")
+
+        rows = self.library.list_songs(status="pending")
+        full = self.library.get_full(rows[0]["id"])
+        self.assertEqual(full["lyrics"]["synced"], LYRICS["synced"])
+        self.assertEqual(full["video_id"], "aaa")
+
+    @patch("app.karaoke_search.search")
+    @patch("app.lyrica_client.get_lyrics_full")
+    @patch("app.lyrica_client.get_metadata")
+    def test_live_path_does_not_prefill_on_a_lyrics_miss(
+        self, mock_metadata, mock_lyrics, mock_karaoke_search
+    ):
+        # A live miss must still get a genuine independent retry in the
+        # background, not be locked into the same failure.
+        mock_metadata.return_value = {"cover_art": "http://art", "duration_s": 253}
+        mock_lyrics.return_value = {"synced": [], "plain": "", "source": ""}
+        mock_karaoke_search.return_value = [{"video_id": "aaa", "score": 20, "duration_seconds": 253}]
+
+        with patch("lyrics.lrclib_client.get_lyrics_full", return_value=None):
+            self.client.get("/select-song?artist=Passenger&title=Let+Her+Go&ytmusic_video_id=ytm42")
+
+        rows = self.library.list_songs(status="pending")
+        full = self.library.get_full(rows[0]["id"])
+        self.assertIsNone(full["lyrics"])
+        self.assertEqual(full["video_id"], "aaa")  # video was still a real success
+
 
 class SongSearchChartsTestCase(unittest.TestCase):
     def test_charts_cleans_and_caps_results(self):

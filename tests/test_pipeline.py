@@ -1,4 +1,5 @@
 import contextlib
+import json
 import os
 import sys
 import tempfile
@@ -84,7 +85,12 @@ class PipelineTestCase(unittest.TestCase):
         self.assertEqual(result["melody"]["source"], "demucs+basic-pitch")
         self.assertEqual([n["midi"] for n in result["melody"]["notes"]], [60, 62])
         kinds = {a["kind"] for a in result["artifacts"]}
-        self.assertEqual(kinds, {"lyrics", "mix", "vocals", "instrumental", "melody", "midi"})
+        # "mix" is never in the final artifact set: once both stems exist,
+        # _cleanup_redundant_mix deletes it (mix = vocals + instrumental
+        # exactly) and _prune_vanished_artifacts drops its produced-list
+        # entry to match.
+        self.assertEqual(kinds, {"lyrics", "vocals", "instrumental", "melody", "midi"})
+        self.assertFalse(self.store.exists(1, artifacts.KIND_MIX))
         self.assertTrue(self.store.exists(1, artifacts.KIND_MIDI))
         with open(self.store.path(1, artifacts.KIND_MIDI), "rb") as handle:
             self.assertEqual(handle.read(4), b"MThd")
@@ -110,12 +116,14 @@ class PipelineTestCase(unittest.TestCase):
         with _vocal_stubs(decode=fake_decode, separate=fake_separate):
             self._build()(_song())
 
-        # The mix + both stems are persisted (singer audio + backing track),
-        # from ONE decode and ONE Demucs pass - the instrumental stage reuses
-        # what the melody stage's separation already wrote.
+        # Both stems are persisted (singer audio + backing track), from ONE
+        # decode and ONE Demucs pass - the instrumental stage reuses what the
+        # melody stage's separation already wrote. mix.wav itself does NOT
+        # persist: once both stems exist it's redundant (reconstructible as
+        # vocals + instrumental) and gets cleaned up at the end of the run.
         self.assertTrue(self.store.exists(1, artifacts.KIND_VOCALS))
         self.assertTrue(self.store.exists(1, artifacts.KIND_INSTRUMENTAL))
-        self.assertTrue(self.store.exists(1, artifacts.KIND_MIX))
+        self.assertFalse(self.store.exists(1, artifacts.KIND_MIX))
         self.assertEqual(len(decode_calls), 1)
         self.assertEqual(len(separate_calls), 1)
 
@@ -230,6 +238,10 @@ class InstrumentalStageTestCase(unittest.TestCase):
         self.assertEqual(result["report"]["melody"]["status"], "reused")
         self.assertEqual(result["report"]["instrumental"]["status"], "ok")
         self.assertTrue(self.store.exists(1, artifacts.KIND_INSTRUMENTAL))
+        # The seeded mix.wav is now redundant (both stems exist) and gets
+        # cleaned up at the end of this backfill run, same as a fresh run.
+        self.assertFalse(self.store.exists(1, artifacts.KIND_MIX))
+        self.assertNotIn("mix", {a["kind"] for a in result["artifacts"]})
 
     def test_reuses_existing_instrumental(self):
         self._seed_processed_song(with_instrumental=True)
@@ -238,6 +250,9 @@ class InstrumentalStageTestCase(unittest.TestCase):
             result = self._build()(_song())
         self.assertEqual(result["report"]["instrumental"]["status"], "reused")
         self.assertIn("instrumental", {a["kind"] for a in result["artifacts"]})
+        # Both stems already existed from a previous run - the seeded
+        # mix.wav is still redundant and still gets cleaned up.
+        self.assertFalse(self.store.exists(1, artifacts.KIND_MIX))
 
     def test_skipped_without_addon(self):
         with _vocal_stubs(available=False):
@@ -258,6 +273,109 @@ class InstrumentalStageTestCase(unittest.TestCase):
         self.assertEqual(result["report"]["instrumental"]["status"], "failed")
         self.assertIn("demucs blew up", result["report"]["instrumental"]["detail"])
         self.assertEqual(result["video_id"], "vid123")  # song still succeeds
+        # instrumental.wav never got produced, so mix.wav is NOT redundant
+        # yet - the cleanup must not fire and strand the one thing a retry
+        # would need to re-separate from.
+        self.assertTrue(self.store.exists(1, artifacts.KIND_MIX))
+
+
+class RedundantMixCleanupTestCase(unittest.TestCase):
+    """Direct unit tests of pipeline._cleanup_redundant_mix, independent of
+    a full process() run - the InstrumentalStageTestCase/PipelineTestCase
+    tests above cover it end-to-end; these pin down the helper's own
+    contract (only fires when BOTH stems exist)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = artifacts.ArtifactStore(tmp.name)
+
+    def test_removes_mix_once_both_stems_exist(self):
+        self.store.write_bytes(1, artifacts.KIND_MIX, b"MIX")
+        self.store.write_bytes(1, artifacts.KIND_VOCALS, b"VOX")
+        self.store.write_bytes(1, artifacts.KIND_INSTRUMENTAL, b"INST")
+        pipeline._cleanup_redundant_mix(self.store, 1)
+        self.assertFalse(self.store.exists(1, artifacts.KIND_MIX))
+
+    def test_leaves_mix_when_only_vocals_exists(self):
+        self.store.write_bytes(1, artifacts.KIND_MIX, b"MIX")
+        self.store.write_bytes(1, artifacts.KIND_VOCALS, b"VOX")
+        pipeline._cleanup_redundant_mix(self.store, 1)
+        self.assertTrue(self.store.exists(1, artifacts.KIND_MIX))
+
+    def test_leaves_mix_when_only_instrumental_exists(self):
+        self.store.write_bytes(1, artifacts.KIND_MIX, b"MIX")
+        self.store.write_bytes(1, artifacts.KIND_INSTRUMENTAL, b"INST")
+        pipeline._cleanup_redundant_mix(self.store, 1)
+        self.assertTrue(self.store.exists(1, artifacts.KIND_MIX))
+
+    def test_no_op_when_mix_already_absent(self):
+        self.store.write_bytes(1, artifacts.KIND_VOCALS, b"VOX")
+        self.store.write_bytes(1, artifacts.KIND_INSTRUMENTAL, b"INST")
+        pipeline._cleanup_redundant_mix(self.store, 1)  # must not raise
+        self.assertFalse(self.store.exists(1, artifacts.KIND_MIX))
+
+
+class PrefilledLyricsVideoTestCase(unittest.TestCase):
+    """A song enqueued right after a live /select-song pick may arrive with
+    lyrics_json/video_id already populated (see app.py's
+    _enqueue_for_library_safe) - _stage_lyrics/_stage_video should reuse
+    them instead of re-fetching."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = artifacts.ArtifactStore(tmp.name)
+
+    def _build(self, **overrides):
+        steps = {
+            "fetch_lyrics": lambda a, t, d: LYRICS,
+            "find_video": lambda a, t, d: VIDEO,
+            "resolve_audio_url": lambda ytm: f"https://audio/{ytm}",
+        }
+        steps.update(overrides)
+        return pipeline.build_processor(self.store, **steps)
+
+    def test_prefilled_lyrics_skip_the_fetch(self):
+        fetch = mock.Mock(side_effect=AssertionError("should not fetch - already resolved by the live pick"))
+        song = _song(lyrics_json=json.dumps(LYRICS))
+        with _vocal_stubs(available=False):
+            result = self._build(fetch_lyrics=fetch)(song)
+        fetch.assert_not_called()
+        self.assertEqual(result["lyrics"]["synced"], LYRICS["synced"])
+        self.assertEqual(result["report"]["lyrics"]["status"], "reused")
+        # Still written to disk as a real artifact, same as a fresh fetch.
+        self.assertTrue(self.store.exists(1, artifacts.KIND_LYRICS))
+
+    def test_prefilled_lyrics_without_synced_lines_falls_through_to_a_real_fetch(self):
+        # app.py never passes through a live miss (see its call site), but
+        # the pipeline guards independently: a prefill without `synced`
+        # must not lock in someone else's failure permanently.
+        song = _song(lyrics_json=json.dumps({"synced": [], "plain": "x"}))
+        with _vocal_stubs(available=False):
+            result = self._build()(song)
+        self.assertEqual(result["report"]["lyrics"]["status"], "ok")
+
+    def test_malformed_lyrics_json_falls_through_to_a_real_fetch(self):
+        song = _song(lyrics_json="not valid json")
+        with _vocal_stubs(available=False):
+            result = self._build()(song)
+        self.assertEqual(result["report"]["lyrics"]["status"], "ok")
+
+    def test_prefilled_video_skips_the_search(self):
+        find = mock.Mock(side_effect=AssertionError("should not search - already resolved by the live pick"))
+        song = _song(video_id="pre123")
+        with _vocal_stubs(available=False):
+            result = self._build(find_video=find)(song)
+        find.assert_not_called()
+        self.assertEqual(result["video_id"], "pre123")
+        self.assertEqual(result["report"]["video"]["status"], "reused")
+
+    def test_no_prefill_behaves_exactly_as_before(self):
+        with _vocal_stubs(available=False):
+            result = self._build()(_song())
+        self.assertEqual(result["report"]["lyrics"]["status"], "ok")
+        self.assertEqual(result["report"]["video"]["status"], "ok")
 
 
 class ProcessingReportTestCase(unittest.TestCase):

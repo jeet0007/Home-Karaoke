@@ -207,18 +207,29 @@ class SongLibrary:
         cover_art="",
         ytmusic_video_id=None,
         priority=PRIORITY_USER,
+        lyrics=None,
+        video_id=None,
     ):
         """Add a song to the processing queue, or return the existing row
         for this identity. A previously-failed song is reset to pending
         (sources change: lyrics get uploaded, videos appear), but ready and
         in-flight songs are returned as-is rather than reprocessed. A
         user-priority enqueue of a song already pending at backfill priority
-        bumps it up the queue (someone is now waiting at the player)."""
+        bumps it up the queue (someone is now waiting at the player).
+
+        `lyrics`/`video_id` let a live /select-song pick that already
+        resolved these (see app.py's _enqueue_for_library_safe) hand them
+        straight to the queued row - pipeline.py's _stage_lyrics/_stage_video
+        then reuse them instead of re-querying Lyrica/yt-dlp for the exact
+        same identity a second time. Left None for the common case (chart
+        backfill, or a live pick that didn't resolve one) - the pipeline
+        just does its own fresh lookup, unchanged."""
         artist = (artist or "").strip()
         title = (title or "").strip()
         if not artist or not title:
             raise ValueError("artist and title are required")
 
+        lyrics_json = json.dumps(lyrics) if lyrics is not None else None
         now = time.time()
         # The post-write re-read (self.get) opens its own connection, so it
         # must happen after the transaction commits - not inside the block.
@@ -237,14 +248,16 @@ class SongLibrary:
 
             if existing is not None:
                 conn.execute(
-                    "UPDATE songs SET status = ?, error = NULL, priority = ?, updated_at = ? WHERE id = ?",
-                    (STATUS_PENDING, priority, now, existing["id"]),
+                    "UPDATE songs SET status = ?, error = NULL, priority = ?, lyrics_json = ?, video_id = ?,"
+                    " updated_at = ? WHERE id = ?",
+                    (STATUS_PENDING, priority, lyrics_json, video_id, now, existing["id"]),
                 )
                 song_id = existing["id"]
             else:
                 cursor = conn.execute(
                     "INSERT INTO songs (artist, title, album, duration_seconds, cover_art, ytmusic_video_id,"
-                    " status, priority, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " status, priority, lyrics_json, video_id, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         artist,
                         title,
@@ -254,6 +267,8 @@ class SongLibrary:
                         ytmusic_video_id,
                         STATUS_PENDING,
                         priority,
+                        lyrics_json,
+                        video_id,
                         now,
                         now,
                     ),

@@ -117,6 +117,15 @@ class ArtifactStore:
         with open(self._peek_path(song_id, kind), encoding="utf-8") as handle:
             return json.load(handle)
 
+    def remove(self, song_id, kind):
+        """Delete a single artifact if present; a no-op if it never existed.
+        Used to drop mix.wav once it's redundant (see
+        pipeline._cleanup_redundant_mix) - unlike remove_song, this targets
+        one artifact kind, not the whole song directory."""
+        peek = self._peek_path(song_id, kind)
+        if os.path.isfile(peek):
+            os.remove(peek)
+
     def remove_song(self, song_id):
         """Delete every artifact for a song (its whole dir). Safe to call
         when nothing was ever written."""

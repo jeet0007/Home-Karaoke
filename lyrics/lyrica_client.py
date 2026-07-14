@@ -162,11 +162,99 @@ def _fetch_lyrics_data(artist, title):
     return payload.get("data") or {}
 
 
+# Past Latin (0x0000-0x007F) + Latin-1 Supplement + Latin Extended-A/B
+# (ends 0x024F) is non-Latin script territory (Devanagari, Arabic, CJK,
+# Cyrillic, ...). Mirrors the 20% threshold Lyrica's own validator.py uses
+# for its cross-script bypass (_has_non_latin) - "mostly non-Latin", not
+# "any non-Latin character at all" (a stray accented name/emoji shouldn't
+# trip this).
+_LATIN_SCRIPT_MAX_CODEPOINT = 0x024F
+_NON_LATIN_FRACTION_THRESHOLD = 0.2
+
+# Individual fetcher IDs tried, one at a time, when the winning (racing)
+# result comes back non-Latin - same pool as the racing sequence below, just
+# queried one-by-one instead of raced, so each is a real single-source
+# result instead of Lyrica's internal winner. A short per-call timeout (not
+# FULL_FETCH_TIMEOUT) bounds the worst case: this is a "prefer it if it's
+# free" pass, not something worth waiting Lyrica's full 60s ceiling for on
+# each of up to 4 remaining candidates.
+_ALTERNATE_FETCHER_IDS = [x.strip() for x in LYRICS_FULL_FETCH_SEQUENCE.split(",") if x.strip()]
+_ALTERNATE_FETCH_TIMEOUT = TIMEOUT
+
+
+def _is_latin_script(text):
+    """True if `text` is predominantly Latin-script (or has no letters to
+    judge at all, e.g. an instrumental placeholder) - see the module-level
+    threshold comment above."""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return True
+    non_latin = sum(1 for c in letters if ord(c) > _LATIN_SCRIPT_MAX_CODEPOINT)
+    return non_latin / len(letters) < _NON_LATIN_FRACTION_THRESHOLD
+
+
+def _script_sample(data):
+    """A representative chunk of text from a Lyrica data dict to run the
+    script check against - the raw `lyrics` field carries "[mm:ss.xx]" tags
+    that are pure ASCII noise, so prefer plain_lyrics/timed_lyrics text."""
+    timed = data.get("timed_lyrics") or []
+    if timed:
+        return " ".join(line.get("text", "") for line in timed[:5])
+    return data.get("plain_lyrics") or data.get("lyrics") or ""
+
+
+def _find_latin_alternative(artist, title):
+    """Try each fetcher in _ALTERNATE_FETCHER_IDS individually (a
+    single-fetcher `sequence=<id>` call bypasses Lyrica's racing/cancel
+    behavior - fetch_lyrics_controller only races when more than one id is
+    given), stopping at the first result that's Latin script. Sequential
+    and short-timeout by design: only runs at all when the winning result
+    was non-Latin, and gives up on a single slow/unresponsive source
+    quickly rather than block on it - this is a "prefer an existing
+    Hinglish submission if one's readily available" pass, not a guarantee."""
+    for fetcher_id in _ALTERNATE_FETCHER_IDS:
+        params = {
+            "artist": artist,
+            "song": title,
+            "timestamps": "true",
+            "pass": "true",
+            "sequence": fetcher_id,
+        }
+        try:
+            response = httpx.get(f"{LYRICA_URL}/lyrics/", params=params, timeout=_ALTERNATE_FETCH_TIMEOUT)
+        except httpx.HTTPError:
+            continue
+        if response.status_code != 200:
+            continue
+        try:
+            payload = response.json()
+        except ValueError:
+            continue
+        if payload.get("status") != "success":
+            continue
+        data = payload.get("data") or {}
+        if data and _is_latin_script(_script_sample(data)):
+            return data
+    return None
+
+
 def get_lyrics_full(artist, title, duration=None):
-    """Return {"synced": [...], "plain": str, "source": str}, or None if not found."""
+    """Return {"synced": [...], "plain": str, "source": str}, or None if not found.
+
+    When the winning (racing) result comes back in a non-Latin script (e.g.
+    Devanagari Hindi), checks the other configured fetchers one at a time for
+    an already-romanized ("Hinglish") submission and prefers that instead -
+    no transliteration, just picking between what Lyrica's sources already
+    have. Only fires for non-Latin winners, so it adds no extra Lyrica calls
+    for the common case."""
     data = _fetch_lyrics_data(artist, title)
     if not data:
         return None
+
+    if not _is_latin_script(_script_sample(data)):
+        alternate = _find_latin_alternative(artist, title)
+        if alternate is not None:
+            data = alternate
 
     timed = data.get("timed_lyrics") or []
     synced = [

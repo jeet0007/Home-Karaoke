@@ -1,0 +1,68 @@
+# Two containers, one shared SQLite DB + data directory - no network API
+# between them (see CLAUDE.md's "Docker deployment" section for why).
+#
+#   web       - lean: search UI, player, streaming, lyrics, live grading.
+#               Always on; this is what you actually watch/sing to.
+#   pipeline  - heavy: Demucs/Basic Pitch/tempo, the background processing
+#               queue. Stop it whenever the NAS needs its CPU back -
+#               `docker compose stop pipeline` - the web container keeps
+#               serving already-processed songs plus fresh live picks
+#               (lyrics + karaoke video, no note guide/instrumental) exactly
+#               as if a song just hadn't finished processing yet. Queued
+#               songs simply wait as `pending` until it's started again.
+#   lyrica    - optional third-party lyrics/metadata sidecar
+#               (github.com/Wilooper/Lyrica). Only builds/starts if you
+#               `docker compose --profile lyrica up` AND have cloned it to
+#               sidecar/lyrica (see README.md); otherwise lyrics fall back
+#               to the direct LRCLIB API with no sidecar at all.
+#
+# Quick start:
+#   docker compose up --build                    # web + pipeline
+#   docker compose --profile lyrica up --build    # + lyrica too
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+    ports:
+      - "${APP_PORT:-5000}:5000"
+    environment:
+      LIBRARY_DB: /data/library.db
+      KARAOKE_DATA_DIR: /data/songs
+      KARAOKE_LOG_DIR: /data/logs
+      LYRICA_URL: http://lyrica:5001
+    volumes:
+      - karaoke-data:/data
+    restart: unless-stopped
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: docker/pipeline.Dockerfile
+    environment:
+      LIBRARY_DB: /data/library.db
+      KARAOKE_DATA_DIR: /data/songs
+      KARAOKE_LOG_DIR: /data/logs
+      LYRICA_URL: http://lyrica:5001
+      # Overridable: e.g. DEMUCS_DEVICE=cpu to pin explicitly, or
+      # KARAOKE_TORCH_THREADS=2 to leave more headroom for other NAS apps.
+      DEMUCS_DEVICE: ${DEMUCS_DEVICE:-auto}
+    volumes:
+      - karaoke-data:/data
+    restart: unless-stopped
+
+  lyrica:
+    profiles: ["lyrica"]
+    build:
+      context: ./sidecar/lyrica
+    ports:
+      - "${LYRICA_PORT:-5001}:5001"
+    environment:
+      PORT: 5001
+    restart: unless-stopped
+
+volumes:
+  # Holds library.db, songs/<id>/ artifacts, and logs/ - everything this app
+  # persists, in one place for easy backup on the NAS.
+  karaoke-data:

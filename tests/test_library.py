@@ -58,6 +58,32 @@ class EnqueueTestCase(unittest.TestCase):
         again = self.lib.enqueue("Passenger", "Let Her Go")
         self.assertEqual(again["status"], library.STATUS_READY)
 
+    def test_enqueue_stores_prefilled_lyrics_and_video(self):
+        # A live /select-song pick that already resolved these passes them
+        # through (see app.py's _enqueue_for_library_safe) so the pipeline's
+        # lyrics/video stages can reuse them instead of re-fetching.
+        song = self.lib.enqueue("Artist", "Title", lyrics=LYRICS, video_id="v123")
+        full = self.lib.get_full(song["id"])
+        self.assertEqual(full["lyrics"], LYRICS)
+        self.assertEqual(full["video_id"], "v123")
+        self.assertEqual(full["status"], library.STATUS_PENDING)  # still queued, not served as ready
+
+    def test_enqueue_without_prefill_leaves_them_null(self):
+        song = self.lib.enqueue("Artist", "Title")
+        full = self.lib.get_full(song["id"])
+        self.assertIsNone(full["lyrics"])
+        self.assertIsNone(full["video_id"])
+
+    def test_requeue_of_a_failed_song_stores_fresh_prefill(self):
+        song = self.lib.enqueue("Artist", "Title")
+        self.lib.mark_failed(song["id"], "no synced lyrics found in any source")
+        requeued = self.lib.enqueue("Artist", "Title", lyrics=LYRICS, video_id="v123")
+        self.assertEqual(requeued["id"], song["id"])
+        full = self.lib.get_full(song["id"])
+        self.assertEqual(full["lyrics"], LYRICS)
+        self.assertEqual(full["video_id"], "v123")
+        self.assertEqual(full["status"], library.STATUS_PENDING)
+
 
 class QueueMechanicsTestCase(unittest.TestCase):
     def setUp(self):
