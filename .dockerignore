@@ -1,0 +1,27 @@
+# Never bake local data/state into an image - these are mounted as volumes
+# instead (see docker-compose.yml).
+data/
+logs/
+library.db*
+
+# Lyrica has its own build context (./sidecar/lyrica) for its own compose
+# service - it must not get copied into the web/pipeline images at all
+# (it's a separate app with its own venv/cache/git history).
+sidecar/
+
+.git/
+.gitignore
+.venv*
+__pycache__/
+*.pyc
+.DS_Store
+.mcp.json
+.claude/
+
+# Rust/wasm build artifacts - only the checked-in static/player/wasm/
+# output is part of the shipped app.
+wasm/grading/target/
+wasm/grading/cross_check/pkg-node/
+
+# Not needed at runtime; keeps both images a bit leaner.
+tests/

@@ -24,10 +24,52 @@ APP_PORT=5050 python app.py
 On macOS, port 5000 is commonly used by AirPlay Receiver (`ControlCenter`). If startup says port 5000
 is already in use, set `APP_PORT=<other port>` and retry, or free port 5000 in System Settings.
 
+## Docker deployment (NAS-friendly)
+
+```bash
+docker compose up --build                     # web + pipeline
+docker compose --profile lyrica up --build     # + the Lyrica lyrics sidecar too
+```
+
+Two containers, split specifically so the heavy one can be turned off independently:
+
+- **`web`** — the search UI, player, streaming, lyrics, live grading. Small image, no ML deps. Always
+  on; port `5000` (override with `APP_PORT`).
+- **`pipeline`** — the background processing queue (Demucs vocal separation, Basic Pitch
+  transcription, tempo estimation). This is the resource-heavy half — no exposed port, nothing talks
+  to it directly. Turn it off whenever the NAS needs its CPU back:
+
+  ```bash
+  docker compose stop pipeline   # web keeps serving ready songs + fresh live picks
+  docker compose start pipeline  # queued songs resume processing right where they left off
+  ```
+
+  With `pipeline` stopped, newly-picked songs just stay `pending` — the web container keeps working
+  exactly as it does today for any not-yet-processed song (lyrics + the picked karaoke video, no note
+  guide/instrumental yet). Nothing breaks; the queue just waits.
+
+The two containers **share a SQLite database and a data volume, not a network API** — `core/library.py`
+already handles multi-process concurrent access (WAL mode), and `core/artifacts.py` is deliberately
+DB-agnostic and network-free, so splitting into two containers needed zero new code beyond a
+standalone entrypoint (`worker.py`) for the queue side. A named volume (`karaoke-data`, mounted at
+`/data` in both containers) holds `library.db`, every song's artifacts, and logs in one place — handy
+for backing up the NAS's karaoke state as a single directory.
+
+**Lyrica** (the optional lyrics sidecar) is a third, profile-gated service — it only builds/starts
+with `--profile lyrica`, and only if you've cloned it to `sidecar/lyrica` first (see
+[Running with the sidecar](#running-with-the-sidecar) below). Without it, lyrics fall back to the
+direct LRCLIB API automatically, same as running outside Docker.
+
+`DEMUCS_DEVICE` defaults to `auto` in the `pipeline` container, which resolves to `cpu` on ordinary
+NAS hardware (no CUDA/Apple Silicon MPS available) — see [Note guide & melody scoring](#note-guide--melody-scoring)
+for `KARAOKE_TORCH_THREADS` if you want to leave more CPU headroom for other NAS apps.
+
 ## Project layout
 
 ```
 app.py            Flask entry point: HTTP/WebSocket routes + wiring
+worker.py         standalone pipeline-queue entrypoint (used by docker/pipeline.Dockerfile)
+docker/           web.Dockerfile (lean) + pipeline.Dockerfile (heavy/ML) - see docker-compose.yml
 core/             the "music -> MIDI" engine + persistence (no web deps)
   pipeline.py       per-song stage orchestration (resumable)
   library.py        SQLite song library + processing queue + append-only stage_runs lineage
@@ -87,9 +129,15 @@ instead of being thrown away in a tempdir, so each stage is independently re-run
 
 Each pipeline stage skips when its artifact already exists — delete just `melody.mid` and the next
 run regenerates it from the kept vocal stem; delete `vocals.wav` too and it re-separates from the
-kept mix. Artifact paths are tracked in the library DB (`artifacts` table). Note: the WAVs
-(`mix.wav`, `vocals.wav`, `instrumental.wav`) are large — point `KARAOKE_DATA_DIR` at a roomy NAS
-volume.
+kept mix (re-decoding it first if that's gone too). Artifact paths are tracked in the library DB
+(`artifacts` table). Note: `vocals.wav`/`instrumental.wav` are large — point `KARAOKE_DATA_DIR` at a
+roomy NAS volume.
+
+**`mix.wav` doesn't stick around.** Since `instrumental = mix - vocals` (how separation produces it),
+`mix.wav` is exactly `vocals.wav + instrumental.wav` — once both stems exist it's pure redundant
+storage, about a third of a song's WAV footprint, and it's never read during playback. The pipeline
+deletes it as soon as both stems are on disk; the only cost if you ever need to regenerate a stem
+from scratch is a ~2s re-decode from the source URL instead of skipping straight to Demucs.
 
 ## Song library & processing queue
 
@@ -100,6 +148,16 @@ and each song already fans out yt-dlp/ffmpeg/Demucs subprocesses) and runs the c
 A "ready" library song then plays instantly from the database with zero live lookups, complete with
 the note guide. The queue *is* the songs table (a `status` column walking pending → processing →
 ready/failed), so queued work survives restarts and failures stay visible with their reason.
+
+**Karaoke first, pipeline second.** A first-time pick never waits on melody/vocal/instrumental
+extraction — those only ever happen in the background queue. You're singing (lyrics + the picked
+karaoke video's audio) within the couple of seconds the live lyrics+video lookup takes; the *next*
+pick of that song, by anyone, gets the fully processed version (note guide, single-source
+instrumental, singer-assist) instantly. The one piece of duplicate work this could cause — the
+background job re-resolving the same lyrics/video the live pick just found — is deduped: a live
+success is handed straight to the queued row, and the pipeline reuses it instead of re-querying
+Lyrica/yt-dlp for the identical identity. A live miss still gets a full independent retry in the
+background, so it's never locked into the same failure.
 
 ```
 GET  /library                → all stored songs with queue status (?status=ready|pending|processing|failed)

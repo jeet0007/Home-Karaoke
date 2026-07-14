@@ -497,11 +497,21 @@ def _serve_library_song(payload):
     return jsonify(response)
 
 
-def _enqueue_for_library_safe(artist, title, duration_seconds=None, cover_art="", ytmusic_video_id=None):
+def _enqueue_for_library_safe(
+    artist, title, duration_seconds=None, cover_art="", ytmusic_video_id=None, lyrics=None, video_id=None
+):
     """Best-effort: every live /select-song also queues the song for full
     background processing, so the NEXT time it's picked it plays instantly
     from the library (with a melody guide). Failures never affect the live
-    response the user is waiting on."""
+    response the user is waiting on.
+
+    `lyrics`/`video_id`: this live pick may have already resolved these -
+    pass them through so the background pipeline reuses them (see
+    core.pipeline._stage_lyrics/_stage_video) instead of re-querying Lyrica/
+    yt-dlp for the identical identity a second time. Callers only pass a
+    REAL success (e.g. select_song() checks synced lyrics / a found video
+    first) - a live miss must still get a genuine independent retry in the
+    background, not be locked into the same failure."""
     try:
         song_library.enqueue(
             artist,
@@ -509,6 +519,8 @@ def _enqueue_for_library_safe(artist, title, duration_seconds=None, cover_art=""
             duration_seconds=duration_seconds,
             cover_art=cover_art,
             ytmusic_video_id=ytmusic_video_id,
+            lyrics=lyrics,
+            video_id=video_id,
         )
     except Exception:
         pass
@@ -578,13 +590,18 @@ def select_song():
     best = pick_best_candidate(candidates, target_duration)
 
     # Queue full background processing (lyrics/video/melody stored in the
-    # library) so the next pick of this song takes the fast path.
+    # library) so the next pick of this song takes the fast path. Pass
+    # through the lyrics/video this live pick already resolved (only when
+    # each was a real success) so the pipeline's lyrics/video stages reuse
+    # them instead of redoing the identical Lyrica/yt-dlp lookups.
     _enqueue_for_library_safe(
         artist,
         title,
         duration_seconds=target_duration,
         cover_art=metadata.get("cover_art", ""),
         ytmusic_video_id=ytmusic_video_id,
+        lyrics=lyrics_result if lyrics_result.get("synced") else None,
+        video_id=best["video_id"] if best else None,
     )
 
     response = {
@@ -983,10 +1000,19 @@ if __name__ == "__main__":
         print(exc, file=sys.stderr)
         sys.exit(1)
 
+    # Debug/reloader mode, default on (today's exact behavior for `python
+    # app.py`/./start.sh). The Docker web container sets FLASK_DEBUG=false:
+    # with the reloader off, Werkzeug never forks the WERKZEUG_RUN_MAIN
+    # child below, so the queue worker naturally never starts there - the
+    # dedicated pipeline container (worker.py) owns it instead. No separate
+    # "don't run the worker" flag needed; turning off debug mode IS that
+    # flag, for free.
+    debug_mode = os.environ.get("FLASK_DEBUG", "true").strip().lower() not in ("false", "0", "")
+
     # Only the reloader's serving child (WERKZEUG_RUN_MAIN=true) runs the
     # queue worker - the reloader parent never serves requests and two
     # workers would double-process every queued song.
-    if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    if debug_mode and os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         start_library_worker()
 
-    app.run(host=app_host, port=app_port, debug=True, threaded=True)
+    app.run(host=app_host, port=app_port, debug=debug_mode, threaded=True)

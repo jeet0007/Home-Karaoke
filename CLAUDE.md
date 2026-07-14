@@ -21,6 +21,10 @@ python app.py                            # run the app (127.0.0.1:5000 by defaul
 python -m unittest discover -s tests -p "test_*.py"   # run the full suite
 python -m unittest tests.test_pipeline                 # run one test module
 python -m unittest tests.test_pipeline.PipelineTestCase.test_some_case  # run one test
+
+docker compose up --build                 # containerized: web + pipeline
+docker compose --profile lyrica up --build  # + Lyrica sidecar (needs sidecar/lyrica cloned)
+docker compose stop pipeline               # reclaim NAS CPU; web keeps serving ready songs
 ```
 
 There is no linter/formatter config in this repo — don't invent one.
@@ -33,6 +37,8 @@ The code is split along one line: a **core "music → MIDI" pipeline** (`core/`)
 
 ```
 app.py            Flask entry point: HTTP/WebSocket routes + wiring
+worker.py         standalone pipeline-queue entrypoint (docker/pipeline.Dockerfile's CMD - see "Docker deployment" below)
+docker/           web.Dockerfile (lean) + pipeline.Dockerfile (heavy, ML deps) - see docker-compose.yml at repo root
 core/             the "music -> MIDI" engine + persistence (no web deps)
   pipeline.py       per-song stage orchestration (resumable; each stage skips if its artifact exists)
   library.py        SQLite song library + background processing queue (SongLibrary, LibraryWorker) + append-only stage_runs lineage
@@ -59,24 +65,38 @@ tests/            unittest suite (mirrors the modules above)
 
 ### Artifacts (reusable intermediates)
 
-Each song's expensive intermediates persist under `KARAOKE_DATA_DIR/<song_id>/` instead of a tempdir, so pipeline stages are independently re-runnable — delete just `melody.mid` and the next run regenerates it from the kept vocal stem; delete `vocals.wav` too and it re-separates from the kept mix.
+Each song's expensive intermediates persist under `KARAOKE_DATA_DIR/<song_id>/` instead of a tempdir, so pipeline stages are independently re-runnable — delete just `melody.mid` and the next run regenerates it from the kept vocal stem; delete `vocals.wav` too and it re-separates from the kept mix (re-decoding it first if that's also gone).
 
 | artifact | file | reused for |
 |---|---|---|
-| decoded mix | `mix.wav` | re-separating vocals without re-downloading |
+| decoded mix | `mix.wav` | re-separating vocals without re-downloading (deleted once redundant - see below) |
 | vocal stem | `vocals.wav` | re-transcribing without re-running Demucs; singer-assist track |
 | instrumental | `instrumental.wav` | the player's preferred backing track (single-source playback) |
 | lyrics | `lyrics.json` | — |
 | melody | `melody.json` | player note guide + grading |
 | MIDI | `melody.mid` | portable/downloadable transcription |
 
-Artifact paths are tracked in the library DB (`artifacts` table). The WAVs (`mix.wav`/`vocals.wav`/`instrumental.wav`) are large — `KARAOKE_DATA_DIR` should point at a roomy volume on constrained hosts (this app targets low-power NAS deployment).
+Artifact paths are tracked in the library DB (`artifacts` table). The WAVs (`vocals.wav`/`instrumental.wav`) are large — `KARAOKE_DATA_DIR` should point at a roomy volume on constrained hosts (this app targets low-power NAS deployment).
+
+**mix.wav is not kept long-term.** `vocal_transcribe.separate_vocals` writes `instrumental = mix - vocals`, so `mix.wav = vocals.wav + instrumental.wav` exactly - once both stems exist, mix.wav is pure redundant storage (a third of a song's WAV footprint) for a file never read at play time. `pipeline._cleanup_redundant_mix` deletes it at the end of any run where both stems are present (fresh separation or a legacy-song instrumental backfill), and `_prune_vanished_artifacts` drops its entry from the `artifacts` table to match. Losing this file only costs a ~2s re-decode (`_substage_decode`) if vocals/instrumental ever need regenerating from scratch - no re-download, since the source URL is re-resolved on demand.
 
 ### Song library & processing queue
 
 Songs picked in the player are queued into a SQLite library (`library.db`, relocatable via `LIBRARY_DB`). A single `LibraryWorker` thread drains the queue one song at a time (deliberately single-threaded — each song fans out yt-dlp/ffmpeg/Demucs subprocesses, and the target host is a small NAS) and runs the core pipeline. The queue *is* the songs table — a `status` column walks `pending → processing → ready/failed`, so it survives restarts. Claiming orders by `priority DESC, id` — a user picking a song at the player (`PRIORITY_USER`, the enqueue default) jumps ahead of `library/seed-charts` backfill work (`PRIORITY_BACKFILL`); re-picking a song already queued at backfill priority promotes it in place.
 
 While a song is in flight, a side thread in `LibraryWorker._process_one` calls `SongLibrary.beat()` every `HEARTBEAT_SECONDS` (30s), stamping `songs.heartbeat_at`. `claim_next_pending()` judges staleness from `COALESCE(heartbeat_at, updated_at)` against `STALE_PROCESSING_SECONDS` (150s) — a legitimately slow stage (Demucs can run minutes) keeps beating and is never touched; a worker killed by a crash or dev-reload stops beating and is reclaimed in ~2.5 minutes instead of the old 15-minute claim-age horizon. `songs.current_stage` (set via `SongLibrary.set_current_stage()`) names the in-flight stage for the UI; both routes below are guarded by `AND status = 'processing'` so a straggler call after the song settles can't resurrect stale bookkeeping.
+
+**Karaoke-first, pipeline-second is the whole point of this queue**: a live pick never blocks on melody/vocals/instrumental — those are 100% background-only, so the user is singing (lyrics + the karaoke video's audio) within the live path's ~1-2s, while the queue does the enrichment work behind them; the *next* pick of that identity, by anyone, gets the fully processed version instantly via `find_ready()`. The one piece of live-path work (lyrics + video search) that WOULD otherwise be redone by the background job is deduped: `enqueue()` accepts optional `lyrics`/`video_id` params, stored directly on the row's existing `lyrics_json`/`video_id` columns; `pipeline._stage_lyrics`/`_stage_video` check for these before calling `fetch_lyrics`/`find_video` and reuse them (`status: "reused"`) when present. `app.py`'s `select_song()` passes these through from its own live lookups (`_enqueue_for_library_safe`) - but ONLY on a real success (synced lyrics present / a video found): a live miss must still get a genuine independent retry in the background, never be locked into the same failure.
+
+### Docker deployment: web/pipeline split
+
+`docker-compose.yml` runs the app as two containers instead of one process: `web` (`docker/web.Dockerfile`, `requirements.txt` only, runs `app.py`) and `pipeline` (`docker/pipeline.Dockerfile`, `requirements.txt` + `requirements-ml.txt` + ffmpeg/git/libsndfile1, runs `worker.py`). This is the same karaoke-first/pipeline-second split described above, made independently stoppable — `docker compose stop pipeline` reclaims the NAS's CPU while `web` keeps serving `ready` songs and fresh live picks, exactly as if the pipeline were just running slowly.
+
+The two containers **share a SQLite DB + data volume, not a network API** — deliberately, matching the "one thread, one .db file, no broker" stance the rest of this doc keeps coming back to. `core/library.py`'s WAL mode already supports concurrent access from multiple *processes* (not just threads) on the same filesystem, and `core/artifacts.py` is already DB-agnostic and network-free by design (see its docstring). So the split needed zero changes to either module — only `worker.py` (a ~20-line standalone entrypoint that imports `app.py` and calls its existing `start_library_worker()` verbatim, then blocks on `LibraryWorker.join()` with SIGTERM/SIGINT wired to `.stop()` for a graceful shutdown) and one line in `app.py`: `FLASK_DEBUG` now gates `debug_mode`, and turning it off (set by `docker/web.Dockerfile`) means Werkzeug never forks its `WERKZEUG_RUN_MAIN` reloader child - so the *existing*, *unmodified* `if ... WERKZEUG_RUN_MAIN == "true": start_library_worker()` gate simply never fires in the web container. No new "don't start the worker" flag was needed.
+
+Both containers mount one named volume at `/data` (`LIBRARY_DB=/data/library.db`, `KARAOKE_DATA_DIR=/data/songs`, `KARAOKE_LOG_DIR=/data/logs`) - importing `app.py` from `worker.py` is safe and side-effect-light (it only builds the Flask WSGI object and registers routes; nothing binds a port unless `app.run()` is called, which only happens in `app.py`'s own `__main__` guard), so the pipeline container ends up with Flask as a dependency too - harmless, since torch/demucs dominate that image's size by orders of magnitude anyway, and it means zero wiring code is duplicated between the two entrypoints.
+
+Lyrica is a third, `profiles: ["lyrica"]`-gated service using its own existing `sidecar/lyrica/Dockerfile` as its build context - opt-in via `docker compose --profile lyrica up`, and only buildable at all once `sidecar/lyrica` has been cloned (see "Lyrics sourcing" below). `LYRICA_URL=http://lyrica:5001` is set unconditionally in both other containers regardless of whether the profile is active - if the service isn't running, `lyrica_client.py`'s calls just fail fast (connection refused) and `lyrics_sources.py` falls through to the direct LRCLIB API, same fail-open behavior as running outside Docker with no sidecar at all.
 
 ### Pipeline lineage & structured logging
 

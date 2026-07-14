@@ -215,5 +215,112 @@ class FullFetchRequestsParallelRacingModeTestCase(unittest.TestCase):
         self.assertIsNone(result)
 
 
+HINDI_LYRICS = "मुझको इतना बताए कोई\nकैसे तुझसे दिल ना लगाए कोई"
+HINGLISH_LYRICS = "Mujhko itna bataye koi\nKaise tujhse dil na lagaye koi"
+
+
+class ScriptPreferenceTestCase(unittest.TestCase):
+    """When the winning (racing) result is non-Latin script, get_lyrics_full
+    checks the other configured fetchers one at a time for an
+    already-romanized alternative - no transliteration, just picking between
+    what Lyrica's own sources already have (see lyrica_client.py's real
+    Kesariya/Tum Hi Ho repro for why this only ever helps sometimes)."""
+
+    def test_is_latin_script(self):
+        self.assertTrue(lyrica_client._is_latin_script(HINGLISH_LYRICS))
+        self.assertFalse(lyrica_client._is_latin_script(HINDI_LYRICS))
+        self.assertTrue(lyrica_client._is_latin_script(""))  # nothing to judge - don't block
+
+    @patch("lyrics.lyrica_client.httpx.get")
+    def test_latin_winner_never_triggers_alternate_lookups(self, mock_get):
+        mock_get.return_value = _response(json_body={
+            "status": "success",
+            "data": {"plain_lyrics": "la la la", "source": "lrclib"},
+        })
+
+        lyrica_client.get_lyrics_full("Passenger", "Let Her Go")
+
+        # Exactly the one racing call - no per-fetcher follow-ups.
+        self.assertEqual(mock_get.call_count, 1)
+
+    @patch("lyrics.lyrica_client.httpx.get")
+    def test_non_latin_winner_is_replaced_by_a_latin_alternative(self, mock_get):
+        racing_response = _response(json_body={
+            "status": "success",
+            "data": {"plain_lyrics": HINDI_LYRICS, "source": "lrclib"},
+        })
+        latin_alternative = _response(json_body={
+            "status": "success",
+            "data": {"plain_lyrics": HINGLISH_LYRICS, "source": "youtube_music"},
+        })
+        # First call is the racing lookup; subsequent calls are the
+        # one-fetcher-at-a-time alternates - the second one hits Latin.
+        mock_get.side_effect = [
+            racing_response,
+            _response(json_body={"status": "error"}),
+            latin_alternative,
+        ]
+
+        result = lyrica_client.get_lyrics_full("Arijit Singh", "Kesariya")
+
+        self.assertEqual(result["plain"], HINGLISH_LYRICS)
+        self.assertEqual(result["source"], "youtube_music")
+
+    @patch("lyrics.lyrica_client.httpx.get")
+    def test_non_latin_winner_kept_when_no_alternative_is_latin(self, mock_get):
+        # Real repro: Kesariya only has 2 sources at all (LRCLIB, YouTube),
+        # both Devanagari - the non-Latin winner must still be returned
+        # rather than discarded just because nothing better was found.
+        non_latin_response = _response(json_body={
+            "status": "success",
+            "data": {"plain_lyrics": HINDI_LYRICS, "source": "lrclib"},
+        })
+        no_result = _response(json_body={"status": "error"})
+        mock_get.side_effect = [non_latin_response] + [no_result] * len(lyrica_client._ALTERNATE_FETCHER_IDS)
+
+        result = lyrica_client.get_lyrics_full("Arijit Singh", "Kesariya")
+
+        self.assertEqual(result["plain"], HINDI_LYRICS)
+        self.assertEqual(result["source"], "lrclib")
+
+    @patch("lyrics.lyrica_client.httpx.get")
+    def test_stops_at_the_first_latin_alternative_found(self, mock_get):
+        non_latin_response = _response(json_body={
+            "status": "success",
+            "data": {"plain_lyrics": HINDI_LYRICS, "source": "lrclib"},
+        })
+        first_latin_hit = _response(json_body={
+            "status": "success",
+            "data": {"plain_lyrics": HINGLISH_LYRICS, "source": "youtube_music"},
+        })
+        mock_get.side_effect = [non_latin_response, first_latin_hit]
+
+        lyrica_client.get_lyrics_full("Arijit Singh", "Kesariya")
+
+        # Racing call + exactly ONE alternate call - stopped as soon as a
+        # Latin hit landed, never tried the remaining fetchers.
+        self.assertEqual(mock_get.call_count, 2)
+
+    @patch("lyrics.lyrica_client.httpx.get")
+    def test_alternate_lookup_tolerates_network_errors(self, mock_get):
+        non_latin_response = _response(json_body={
+            "status": "success",
+            "data": {"plain_lyrics": HINDI_LYRICS, "source": "lrclib"},
+        })
+
+        def flaky(*_args, **kwargs):
+            if kwargs["params"]["sequence"] == lyrica_client.LYRICS_FULL_FETCH_SEQUENCE:
+                return non_latin_response  # the initial racing call
+            raise httpx.ReadTimeout("simulated flaky alternate source")
+
+        mock_get.side_effect = flaky
+
+        result = lyrica_client.get_lyrics_full("Arijit Singh", "Kesariya")
+
+        # Every alternate attempt errored - the original non-Latin result is
+        # still returned rather than the whole lookup failing.
+        self.assertEqual(result["plain"], HINDI_LYRICS)
+
+
 if __name__ == "__main__":
     unittest.main()

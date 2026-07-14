@@ -44,6 +44,16 @@ class ArtifactStoreTestCase(unittest.TestCase):
     def test_size_zero_when_missing(self):
         self.assertEqual(self.store.size(1, artifacts.KIND_MIDI), 0)
 
+    def test_remove_deletes_one_artifact(self):
+        self.store.write_bytes(4, artifacts.KIND_MIX, b"MIX")
+        self.store.write_bytes(4, artifacts.KIND_VOCALS, b"VOX")
+        self.store.remove(4, artifacts.KIND_MIX)
+        self.assertFalse(self.store.exists(4, artifacts.KIND_MIX))
+        self.assertTrue(self.store.exists(4, artifacts.KIND_VOCALS))  # untouched
+
+    def test_remove_is_a_no_op_when_never_written(self):
+        self.store.remove(7, artifacts.KIND_MIX)  # no raise
+
     def test_remove_song_clears_all_artifacts(self):
         self.store.write_bytes(3, artifacts.KIND_MIX, b"a")
         self.store.write_bytes(3, artifacts.KIND_VOCALS, b"b")

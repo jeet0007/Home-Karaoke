@@ -24,8 +24,16 @@ CLI/cron without dragging the web layer along.
 Resumability / separate reprocessing: each stage checks the store and skips
 when its artifact already exists. Delete just `melody.mid` and the next run
 regenerates it from the kept vocal stem without re-running Demucs; delete
-`vocals.wav` too and it re-separates from the kept mix without re-downloading.
-That is the point of persisting intermediates instead of using a tempdir.
+`vocals.wav` too and it re-separates from mix.wav (re-decoding it first if
+that's also gone - see `_substage_decode`). That is the point of persisting
+intermediates instead of using a tempdir - but mix.wav itself is deliberately
+NOT kept once it's redundant: `instrumental = mix - vocals` (see
+`vocal_transcribe.separate_vocals`), so once both stems exist, mix.wav is
+exactly reconstructible from them and serves no purpose except the
+above resumability trick - `_cleanup_redundant_mix` deletes it at the end of
+a run where both stems are present, cutting roughly a third of a song's WAV
+footprint. A song missing only mix.wav simply re-decodes from the source URL
+(~2s) if vocals/instrumental ever need regenerating from scratch.
 
 Network-bound steps (lyrics lookup, karaoke-video ranking, yt-dlp stream
 resolution) are injected as callables so this module stays import-light and
@@ -35,7 +43,9 @@ cheap; vocal_transcribe/tempo only pull in torch/librosa lazily, inside
 their functions, when actually used.
 """
 
+import json
 import logging
+import os
 import time
 import uuid
 
@@ -174,9 +184,47 @@ def _stage(ctx, name, status, detail, *, started_at=None, input_hashes=None, out
     )
 
 
+def _parse_prefilled_lyrics(raw):
+    """A song enqueued right after a live /select-song pick may already carry
+    the lyrics that pick resolved (app.py's _enqueue_for_library_safe passes
+    them through into SongLibrary.enqueue's lyrics_json column) - reuse them
+    instead of re-querying Lyrica/LRCLIB from scratch for the exact same
+    identity.
+
+    Only counts as reusable when synced lines are present. app.py never
+    passes through a live miss (see its call site), but this checks anyway:
+    a prefill without `synced` must fall through to a genuine independent
+    fetch rather than permanently locking in someone else's failure."""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    if isinstance(parsed, dict) and parsed.get("synced"):
+        return parsed
+    return None
+
+
 def _stage_lyrics(song, store, produced, fetch_lyrics, ctx):
     started_at = time.time()
     ctx.begin("lyrics")
+
+    prefilled = _parse_prefilled_lyrics(song.get("lyrics_json"))
+    if prefilled is not None:
+        store.write_json(song["id"], artifacts.KIND_LYRICS, prefilled)
+        _record(produced, store, song["id"], artifacts.KIND_LYRICS)
+        _stage(
+            ctx,
+            "lyrics",
+            "reused",
+            f"reused {len(prefilled['synced'])} synced lines already resolved by the live pick",
+            started_at=started_at,
+            output_path=store.path(song["id"], artifacts.KIND_LYRICS),
+            output_hash=store.content_hash(song["id"], artifacts.KIND_LYRICS),
+        )
+        return prefilled
+
     lyrics = fetch_lyrics(song["artist"], song["title"], song["duration_seconds"])
     if not lyrics or not lyrics.get("synced"):
         _stage(ctx, "lyrics", "failed", "no synced lyrics found in any source", started_at=started_at)
@@ -198,6 +246,18 @@ def _stage_lyrics(song, store, produced, fetch_lyrics, ctx):
 def _stage_video(song, find_video, ctx):
     started_at = time.time()
     ctx.begin("video")
+
+    if song.get("video_id"):
+        # Same reasoning as _parse_prefilled_lyrics: the live pick that
+        # enqueued this song already ran the karaoke-video search - reuse
+        # its winner instead of re-running the same ranked search again.
+        video = {"video_id": song["video_id"], "duration_seconds": song.get("duration_seconds")}
+        _stage(
+            ctx, "video", "reused", f"reused backing video {video['video_id']} already resolved by the live pick",
+            started_at=started_at,
+        )
+        return video
+
     video = find_video(song["artist"], song["title"], song["duration_seconds"])
     if not video or not video.get("video_id"):
         _stage(ctx, "video", "failed", "no karaoke backing track found", started_at=started_at)
@@ -493,6 +553,35 @@ def _melody_midi_bytes(result):
     return midi.notes_to_midi_bytes(result.get("notes") or [], bpm=result.get("bpm") or midi.DEFAULT_BPM)
 
 
+def _cleanup_redundant_mix(store, song_id):
+    """mix.wav is fully reconstructible as vocals.wav + instrumental.wav
+    (vocal_transcribe.separate_vocals writes instrumental as mix - vocals,
+    so mix = vocals + instrumental exactly) - once both stems exist on disk,
+    mix.wav is pure redundant storage: roughly a third of a song's WAV
+    footprint, for a file never read at play time (only during separation
+    and tempo estimation, both already done by the time this runs).
+
+    Best-effort and silent: a filesystem hiccup here must never fail an
+    otherwise-successful song, and there's nothing worth reporting - this is
+    housekeeping, not a pipeline stage (no _stage() call, no stage_runs row).
+    Only fires once BOTH stems exist, so it can never delete the one
+    remaining source a still-in-progress or failed separation needs."""
+    if store.exists(song_id, artifacts.KIND_VOCALS) and store.exists(song_id, artifacts.KIND_INSTRUMENTAL):
+        try:
+            store.remove(song_id, artifacts.KIND_MIX)
+        except OSError:
+            pass
+
+
+def _prune_vanished_artifacts(produced):
+    """An artifact recorded as 'produced' earlier in the run (the decoded
+    mix) may be deliberately removed later in the SAME run (see
+    _cleanup_redundant_mix) - drop those entries here so mark_ready's
+    artifacts table reflects final on-disk reality, not a mid-run snapshot
+    that would otherwise point at a file that no longer exists."""
+    return [entry for entry in produced if os.path.isfile(entry["path"])]
+
+
 def build_processor(store, *, fetch_lyrics, find_video, resolve_audio_url):
     """Compose the per-song pipeline over an ArtifactStore.
 
@@ -526,13 +615,14 @@ def build_processor(store, *, fetch_lyrics, find_video, resolve_audio_url):
         video = _stage_video(song, find_video, ctx)
         melody_result = _stage_melody(song, lyrics, store, produced, resolve_audio_url, ctx)
         _stage_instrumental(song, store, produced, resolve_audio_url, ctx)
+        _cleanup_redundant_mix(store, song["id"])
 
         return {
             "lyrics": lyrics,
             "video_id": video["video_id"],
             "duration_seconds": video.get("duration_seconds"),
             "melody": melody_result,
-            "artifacts": produced,
+            "artifacts": _prune_vanished_artifacts(produced),
             "report": ctx.report,
             "stage_runs": ctx.stage_runs,
             "run_id": run_id,
