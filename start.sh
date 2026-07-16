@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LYRICA_DIR="$SCRIPT_DIR/sidecar/lyrica"
 LYRICA_PORT="${LYRICA_PORT:-5001}"
 APP_HOST="${APP_HOST:-127.0.0.1}"
-APP_PORT="${APP_PORT:-5000}"
+APP_PORT="${APP_PORT:-3000}"
 
 LYRICA_PID=""
 

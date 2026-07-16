@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Now Singing</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #181b22;
+    --panel-hover: #20242e;
+    --border: #2a2e38;
+    --text: #e8e9ed;
+    --muted: #8b8fa3;
+    --accent: #ff4d6d;
+    --accent-dim: #7a2536;
+    --good: #4dd28c;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+
+  #app {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    padding: 0 1.1rem 1rem;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    padding: 1.1rem 0 0.75rem;
+  }
+
+  .back-link {
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 1.3rem;
+    line-height: 1;
+  }
+
+  .now-singing-heading { min-width: 0; }
+
+  #ns-title {
+    font-size: 1.05rem;
+    font-weight: 700;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  #ns-artist {
+    font-size: 0.82rem;
+    color: var(--muted);
+  }
+
+  .score {
+    margin-left: auto;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    padding: 0.4rem 0.75rem;
+    border: 1px solid var(--good);
+    border-radius: 999px;
+    background: var(--accent-dim);
+    color: var(--good);
+    font-weight: 800;
+    font-size: 0.8rem;
+  }
+
+  .mic-group {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-top: 0.7rem;
+    flex-shrink: 0;
+  }
+
+  #ctl-mic {
+    height: 42px;
+    padding: 0 1rem;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    font-weight: 700;
+    font-size: 0.82rem;
+    flex-shrink: 0;
+  }
+
+  #ctl-mic[aria-pressed="true"] {
+    border-color: var(--good);
+    color: var(--good);
+  }
+
+  #voice-assist-slider {
+    flex: 1;
+  }
+
+  #voice-assist-slider[hidden] {
+    display: none;
+  }
+
+  .lyrics-panel {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1.5rem 0.25rem;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: rgba(24, 27, 34, 0.55);
+    scroll-behavior: smooth;
+  }
+
+  .lyrics-empty {
+    height: 100%;
+    display: grid;
+    place-items: center;
+    color: var(--muted);
+    text-align: center;
+    padding: 0 1rem;
+  }
+
+  .lyric-line {
+    padding: 0.45rem 0.9rem;
+    color: var(--muted);
+    font-size: 1rem;
+    line-height: 1.4;
+    text-align: center;
+    transition: color 0.15s ease, opacity 0.15s ease;
+  }
+
+  .lyric-line.past { opacity: 0.4; }
+  .lyric-line.current { color: var(--accent); opacity: 1; font-weight: 800; }
+  .lyric-line.upcoming { opacity: 0.72; }
+
+  .controls {
+    display: flex;
+    gap: 0.6rem;
+    margin-top: 1rem;
+    flex-shrink: 0;
+  }
+
+  .controls button {
+    flex: 1;
+    height: 46px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    font-weight: 700;
+    font-size: 0.85rem;
+  }
+
+  .controls button:active { background: var(--panel-hover); }
+
+  #ctl-toggle { border-color: var(--accent); color: var(--accent); }
+</style>
+</head>
+<body data-code="{{ code }}">
+  <div id="app">
+    <header>
+      <a class="back-link" href="/room/{{ code }}" aria-label="Back to Sing Room">&larr;</a>
+      <div class="now-singing-heading">
+        <div id="ns-title">Waiting for a song&hellip;</div>
+        <div id="ns-artist"></div>
+      </div>
+      <div class="score" aria-label="Score">Score: <span>★ --</span></div>
+    </header>
+
+    <section id="lyrics-panel" class="lyrics-panel" aria-live="polite">
+      <div class="lyrics-empty">Nothing playing yet &mdash; add a song from the queue.</div>
+    </section>
+
+    <!-- Local mic scoring (grading.js) + the voice-assist blend slider,
+         which remotely adjusts how much of the original vocal the TV mixes
+         into its own local playback (core/rooms.py's
+         set_voice_assist_volume) - see static/phone/now-singing.js. The
+         slider only appears once the current song's resolved payload says
+         a vocal stem was processed for it. -->
+    <div class="mic-group" aria-label="Mic scoring and voice assist">
+      <button id="ctl-mic" type="button" aria-pressed="false">Start Mic</button>
+      <input id="voice-assist-slider" type="range" min="0" max="1" step="0.01" value="0.5" aria-label="Original vocal blend" hidden>
+    </div>
+
+    <section class="controls" aria-label="Remote control">
+      <button id="ctl-restart" type="button">Restart</button>
+      <button id="ctl-toggle" type="button">Play / Pause</button>
+      <button id="ctl-skip" type="button">Skip</button>
+    </section>
+  </div>
+
+  <!-- grading.js (imported by now-singing.js for local mic scoring) pulls
+       in note-guide.js as a transitive dependency, which unconditionally
+       does noteGuideCanvas.getContext('2d') at module-load time - this
+       canvas exists purely so that lookup doesn't throw on a page with no
+       visible note guide. Never shown; the phone has no note-guide UI. -->
+  <canvas id="note-guide-canvas" hidden></canvas>
+
+<script type="module" src="/static/phone/now-singing.js"></script>
+</body>
+</html>

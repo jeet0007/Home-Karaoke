@@ -15,7 +15,7 @@ VIDEO_ID = "dQw4w9WgXcQ"
 
 class AppConfigTestCase(unittest.TestCase):
     def test_resolve_host_port_defaults(self):
-        self.assertEqual(app_module._resolve_host_port({}), ("127.0.0.1", 5000))
+        self.assertEqual(app_module._resolve_host_port({}), ("127.0.0.1", 3000))
 
     def test_resolve_host_port_uses_env_values(self):
         env = {"APP_HOST": "0.0.0.0", "APP_PORT": "5050"}

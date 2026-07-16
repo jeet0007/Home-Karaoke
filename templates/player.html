@@ -370,6 +370,32 @@
     opacity: 0.72;
   }
 
+  /* TV-side room-pairing status (see static/player/room-broadcast.js) -
+     only shown when the player URL carries ?room=<code>, i.e. this page is
+     being driven as a room's TV rather than a standalone single-device
+     player. */
+  .room-overlay {
+    position: fixed;
+    right: 1rem;
+    bottom: 1rem;
+    z-index: 5;
+    padding: 0.6rem 0.9rem;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(15, 17, 21, 0.82);
+    font-size: 0.8rem;
+    color: var(--muted);
+    text-align: right;
+  }
+
+  .room-overlay[hidden] { display: none; }
+
+  .room-overlay-code {
+    font-weight: 700;
+    color: var(--text);
+    letter-spacing: 0.08em;
+  }
+
   @media (max-width: 680px) {
     .page {
       width: min(100% - 1rem, 1100px);
@@ -421,9 +447,9 @@
 
 <main class="page">
   <div class="topbar">
-    <a class="back-link" href="/">Back to search</a>
+    <a class="back-link" href="/tv">TV Lobby</a>
     <div class="song-heading">
-      <h1>{{ title }} <span>&mdash; {{ artist }}</span></h1>
+      <h1><span id="song-title-text">{{ title }}</span> <span>&mdash; <span id="song-artist-text">{{ artist }}</span></span></h1>
     </div>
     <div aria-hidden="true"></div>
   </div>
@@ -497,6 +523,11 @@
     <div class="lyrics-empty">Loading lyrics...</div>
   </section>
 </main>
+
+<div id="room-overlay" class="room-overlay" hidden>
+  <div class="room-overlay-code">Room <span id="room-overlay-code"></span></div>
+  <div id="room-overlay-upnext"></div>
+</div>
 
 <script src="/static/thumbnail-fallback.js"></script>
 <script>

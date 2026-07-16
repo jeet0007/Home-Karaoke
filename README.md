@@ -1,28 +1,42 @@
 # Home Karaoke
 
-A tiny self-hosted karaoke app (built to run comfortably on a low-power NAS): search any song via
-YouTube Music, get synced lyrics from multiple sources, sing along to an auto-picked karaoke backing
-track with a visual note guide, and get scored live against the song's actual melody. Candidate
-videos are automatically ranked by karaoke signals (karaoke/instrumental/backing-track/no-vocals
-versions boosted, covers/reactions penalised), served through a minimal dark-themed vanilla JS GUI.
+A tiny self-hosted karaoke app (built to run comfortably on a low-power NAS): a TV displays a fixed
+QR code, phones scan it to join, search any song via YouTube Music, and add it to the room's shared
+queue; the TV plays each pick in turn with synced lyrics from multiple sources, an auto-picked
+karaoke backing track, a visual note guide, and live scoring against the song's actual melody (mic
+captured on the singer's own phone). Candidate videos are automatically ranked by karaoke signals
+(karaoke/instrumental/backing-track/no-vocals versions boosted, covers/reactions penalised).
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
-python app.py
+git clone https://github.com/Wilooper/Lyrica sidecar/lyrica   # one-time
+./start.sh
 ```
 
-Then open http://localhost:5000 in your browser.
+`./start.sh` is the standard way to run this locally - it installs Lyrica's own dependencies, starts
+the sidecar, waits for it to be ready, then starts the main app wired to it (`LYRICA_URL`). Lyrica is
+the primary lyrics/metadata source and, per `lyrics/lyrics_filter.py`, is what `/unified-search`'s
+pre-selection lyrics check talks to - running it every time (not just occasionally) is what keeps
+search fast and results accurate. Without it, the app still runs (`python app.py` alone works and
+falls back to the direct LRCLIB API - see [Lyrics](#lyrics) below), but that fallback path is slower
+and depends on `lrclib.net` being reachable from wherever you're running this.
 
-The main app binds to `127.0.0.1:5000` by default. Set `APP_PORT` or `APP_HOST` to change that:
+Then open http://localhost:3000/tv on the TV's browser - it boots straight into the Sing Room lobby
+and shows a QR code. Scan it with a phone on the same network to join, search, and queue songs (see
+"TV + phone room pairing" in CLAUDE.md for the `APP_HOST=0.0.0.0` / `APP_LAN_HOST` requirements a
+phone needs to actually reach it).
+
+The main app binds to `127.0.0.1:3000` by default. Set `APP_PORT` or `APP_HOST` to change that:
 
 ```bash
-APP_PORT=5050 python app.py
+APP_PORT=5050 ./start.sh
 ```
 
-On macOS, port 5000 is commonly used by AirPlay Receiver (`ControlCenter`). If startup says port 5000
-is already in use, set `APP_PORT=<other port>` and retry, or free port 5000 in System Settings.
+(Deliberately not port 5000: macOS's AirPlay Receiver, `ControlCenter`, squats on it by default and
+silently swallows requests instead of a clean port-in-use error.) If startup says your chosen port is
+already in use, set `APP_PORT=<other port>` and retry.
 
 ## Docker deployment (NAS-friendly)
 
@@ -34,7 +48,7 @@ docker compose --profile lyrica up --build     # + the Lyrica lyrics sidecar too
 Two containers, split specifically so the heavy one can be turned off independently:
 
 - **`web`** — the search UI, player, streaming, lyrics, live grading. Small image, no ML deps. Always
-  on; port `5000` (override with `APP_PORT`).
+  on; port `3000` (override with `APP_PORT`).
 - **`pipeline`** — the background processing queue (Demucs vocal separation, Basic Pitch
   transcription, tempo estimation). This is the resource-heavy half — no exposed port, nothing talks
   to it directly. Turn it off whenever the NAS needs its CPU back:
@@ -91,9 +105,9 @@ lyrics/           multi-source lyrics
   lyrics_filter.py  pre-selection lyrics-availability filtering
 wasm/grading/     Rust port of the YIN pitch detector, compiled to WASM (dev-time-only Rust dep;
                   compiled output is checked into static/player/wasm/, see wasm/grading/README.md)
-templates/ static/  the vanilla-JS player + search GUI - live grading runs client-side via the WASM
-                  module in an AudioWorklet, falling back to the /grade WebSocket only if
-                  WebAssembly is unavailable
+templates/ static/  the vanilla-JS TV player + phone GUIs (TV+phone room pairing - see CLAUDE.md) -
+                  live grading runs client-side via the WASM module in an AudioWorklet, falling back
+                  to the /grade WebSocket only if WebAssembly is unavailable
 scripts/bootstrap_ml.py  detects OS/CPU/Python version, installs requirements-ml.txt + the right extra
 tests/            unittest suite (mirrors the modules above)
 ```
@@ -288,7 +302,7 @@ git clone https://github.com/Wilooper/Lyrica sidecar/lyrica
 ```
 
 This installs Lyrica's own dependencies, starts it on port 5001, waits for it to come up, then starts
-this app on port 5000. Set `APP_PORT` or `APP_HOST` to change this app's bind address. Set
+this app on port 3000. Set `APP_PORT` or `APP_HOST` to change this app's bind address. Set
 `LYRICA_PORT` to change the sidecar's port, or `LYRICA_URL` to point at an already-running / remote
 Lyrica instance instead (e.g. `LYRICA_URL=https://wilooper-lyrica.hf.space`).
 

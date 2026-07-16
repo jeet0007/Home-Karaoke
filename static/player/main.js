@@ -23,11 +23,14 @@ import {
 import { ensureGradingStarted, stopGrading, sendPositionSync } from './grading.js';
 import { enableControls, setPlayButton, togglePlayback, restartPlayback, loadStream, loadLocalTrack } from './playback.js';
 import { setupSingerAssist, resync as resyncSingerAssist } from './singer-assist.js';
+import { initRoomBroadcast, reportResolved } from './room-broadcast.js';
 
 const { title: songTitle, artist, duration: durationHint, ytmusicVideoId } = window.PLAYER_CONFIG;
 
 const coverArt = document.getElementById('cover-art');
 const artBackgroundImg = document.getElementById('art-background-img');
+const songTitleEl = document.getElementById('song-title-text');
+const songArtistEl = document.getElementById('song-artist-text');
 const audio = document.getElementById('audio');
 const playPauseBtn = document.getElementById('play-pause');
 const restartBtn = document.getElementById('restart');
@@ -84,8 +87,20 @@ function syncLyrics() {
 
 const LYRICS_RETRY_DELAY_MS = 6000;
 
-async function loadSong() {
+// Loads a song by identity rather than closing over the page's own
+// PLAYER_CONFIG, so it can be called more than once per page load: once at
+// boot for whatever song the URL names, and again by room-broadcast.js
+// every time the room's TV advances to a new queue entry - the player page
+// itself is never reloaded for a room's later songs (see
+// static/player/room-broadcast.js). Returns the /select-song response on
+// success, or null on failure (nothing meaningful to report to phones in
+// that case - the existing overlay error state is enough).
+async function loadSongByIdentity({ title: songTitle, artist, duration: durationHint, ytmusicVideoId }) {
   setOverlayLoading('Looking up lyrics and a matching video...');
+  songTitleEl.textContent = songTitle;
+  songArtistEl.textContent = artist;
+  coverArt.hidden = true;
+  artBackgroundImg.classList.remove('is-loaded');
 
   try {
     const params = new URLSearchParams({ artist, title: songTitle });
@@ -98,7 +113,7 @@ async function loadSong() {
     if (!res.ok) {
       setOverlayError(data.error || 'Could not load this song.');
       showLyricsFallback();
-      return;
+      return null;
     }
 
     if (data.cover_art) {
@@ -128,6 +143,7 @@ async function loadSong() {
     singleSource = Boolean(data.has_instrumental);
     syncGroup.hidden = singleSource;
     setArtBackground(data.video_id);
+    reportResolved(data);
 
     if (singleSource) {
       // Preferred path: play the original recording's own instrumental
@@ -135,21 +151,23 @@ async function loadSong() {
       // per-video nudge belongs to the karaoke-upload fallback, not here.
       loadSyncOffset(null);
       loadLocalTrack(`/library/song/${data.song_id}/instrumental`);
-      return;
+      return data;
     }
 
     if (!data.video_id) {
       setOverlayNoBackingTrack(data.message || 'No backing track found for this song.');
-      return;
+      return data;
     }
 
     // Fallback: stream the picked karaoke upload's audio. Restore any sync
     // nudge saved for this backing track on a past visit.
     loadSyncOffset(data.video_id);
     await loadStream(data.video_id);
+    return data;
   } catch (err) {
     setOverlayError('Network error — is the server running?');
     showLyricsFallback();
+    return null;
   }
 }
 
@@ -189,7 +207,8 @@ document.addEventListener('keydown', (e) => {
 
 audio.autoplay = true;
 audio.muted = true;
-loadSong();
+loadSongByIdentity({ title: songTitle, artist, duration: durationHint, ytmusicVideoId });
+initRoomBroadcast(loadSongByIdentity);
 animationFrameId = requestAnimationFrame(syncLyrics);
 window.addEventListener('beforeunload', () => {
   cancelAnimationFrame(animationFrameId);

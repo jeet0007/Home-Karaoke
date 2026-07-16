@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Home Karaoke</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #181b22;
+    --border: #2a2e38;
+    --text: #e8e9ed;
+    --muted: #8b8fa3;
+    --accent: #ff4d6d;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1.75rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+
+  h1 {
+    margin: 0;
+    font-size: 1.5rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--muted);
+  }
+
+  h1 span { color: var(--accent); }
+
+  .qr-frame {
+    width: 220px;
+    height: 220px;
+    background: #fff;
+    border-radius: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 12px;
+  }
+
+  .qr-frame img { width: 100%; height: 100%; }
+
+  .hint {
+    color: var(--muted);
+    font-size: 0.95rem;
+    text-align: center;
+    max-width: 30rem;
+  }
+
+  #joined-players {
+    display: flex;
+    gap: 1.25rem;
+    margin-top: 0.5rem;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .joined-player, .waiting-slot {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  .avatar {
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: var(--panel);
+    border: 1.5px solid var(--border);
+  }
+
+  .waiting-slot .avatar {
+    background: transparent;
+    border: 1.5px dashed var(--border);
+  }
+
+  .joined-player .name, .waiting-slot .name {
+    font-size: 0.75rem;
+    color: var(--muted);
+  }
+
+  .room-code {
+    font-size: 0.75rem;
+    letter-spacing: 0.1em;
+    color: var(--border);
+  }
+</style>
+</head>
+<body>
+  <h1>Scan with your phone camera to <span>join</span></h1>
+  <div class="qr-frame"><img id="qr-code" alt="Scan to join"></div>
+  <p class="hint">This QR code is fixed for this TV — no typing needed.</p>
+  <div id="joined-players">
+    <div class="waiting-slot">
+      <div class="avatar"></div>
+      <div class="name">waiting...</div>
+    </div>
+  </div>
+  <div class="room-code" id="room-code"></div>
+
+<script type="module" src="/static/tv/lobby.js"></script>
+</body>
+</html>

@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import numpy as np
-from flask import Flask, Response, copy_current_request_context, jsonify, render_template, request, send_file, stream_with_context
+from flask import Flask, Response, copy_current_request_context, jsonify, redirect, render_template, request, send_file, stream_with_context
 from flask_sock import Sock
 from simple_websocket import ConnectionClosed
 
@@ -21,6 +21,8 @@ from core import artifacts
 from core import library
 from core import logging_config
 from core import pipeline
+from core import rooms
+from core.qrcode_svg import qr_svg
 from core.audio_grading import RealtimeGrader, parse_melody
 from lyrics import lyrica_client
 from lyrics import lyrics_sources
@@ -52,6 +54,8 @@ song_library = library.SongLibrary(os.environ.get("LIBRARY_DB", library.DEFAULT_
 # Reusable per-song artifacts (vocal stem, lyrics, MIDI, ...) on disk. Set
 # KARAOKE_DATA_DIR to put them on a roomy NAS volume - they can grow large.
 artifact_store = artifacts.ArtifactStore(os.environ.get("KARAOKE_DATA_DIR", artifacts.DEFAULT_ROOT))
+# TV+phone room pairing (see core/rooms.py) - in-memory, single-process only.
+room_registry = rooms.RoomRegistry()
 BINARY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "binaries", "yt-dlp")
 
 SEED_CHARTS_DEFAULT_LIMIT = 20
@@ -86,7 +90,10 @@ _http_client = httpx.Client(follow_redirects=True, timeout=20.0)
 def _resolve_host_port(env=None):
     env = os.environ if env is None else env
     host = env.get("APP_HOST", "127.0.0.1")
-    port_text = env.get("APP_PORT", "5000")
+    # Not 5000: macOS's AirPlay Receiver (ControlCenter) squats on it by
+    # default, which silently swallows requests instead of a clean
+    # port-in-use error - see _assert_port_available below.
+    port_text = env.get("APP_PORT", "3000")
 
     try:
         port = int(port_text)
@@ -109,6 +116,30 @@ def _assert_port_available(host, port):
             raise RuntimeError(
                 f"Port {port} is already in use on {host} — set APP_PORT=<other port> and retry, or free the port"
             ) from exc
+
+
+def _detect_lan_ip(env=None):
+    """Best-effort LAN IP for the room QR code's join URL. APP_HOST is
+    typically 0.0.0.0 or 127.0.0.1, neither of which a phone on the same
+    network can actually connect to. Uses the standard "connect" a UDP
+    socket to learn which local address the OS would route through trick -
+    no packet is actually sent (UDP connect() only resolves a route).
+    Override with APP_LAN_HOST when auto-detection guesses wrong: multiple
+    NICs, a VPN interface, or Docker's default bridge network, where a
+    container's own view of "LAN" isn't the host's (see CLAUDE.md's Docker
+    deployment section).
+    """
+    env = os.environ if env is None else env
+    override = env.get("APP_LAN_HOST", "").strip()
+    if override:
+        return override
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        try:
+            probe.connect(("8.8.8.8", 80))
+            return probe.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
 
 
 def _resolve_stream_urls(url, format_selector, timeout):
@@ -244,7 +275,17 @@ def start_library_worker():
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    """The app's single-device search/library home page was retired in
+    favor of the TV+phone room-pairing flow - a TV's browser now boots
+    straight into the Sing Room lobby."""
+    return redirect("/tv")
+
+
+@app.route("/tv")
+def tv_lobby():
+    """What a TV points its browser at to boot into the Sing Room lobby
+    (static/tv/lobby.js creates a room and shows its join QR code)."""
+    return render_template("tv_lobby.html")
 
 
 def _run_karaoke_search(query, limit):
@@ -957,6 +998,218 @@ def grade(ws):
                 ws.send(json.dumps(update))
     except ConnectionClosed:
         pass
+
+
+ROOM_TRENDING_LIMIT = 8
+ROOM_GROUP_PICKS_LIMIT = 8
+_ROOM_TRENDING_TTL_S = 300
+_room_trending_cache = None  # (expires_at, songs) once populated
+_room_trending_lock = threading.Lock()
+
+
+def _get_trending_songs():
+    """song_search.charts() hits ytmusicapi over the network - cached
+    briefly (same TTL shape as _live_select_cache above) since every phone's
+    Home screen load would otherwise repeat it."""
+    global _room_trending_cache
+    with _room_trending_lock:
+        if _room_trending_cache is not None:
+            expires_at, cached_songs = _room_trending_cache
+            if expires_at >= time.time():
+                return cached_songs
+
+    try:
+        songs = song_search.charts(limit=ROOM_TRENDING_LIMIT)
+    except SongSearchError:
+        songs = []
+
+    with _room_trending_lock:
+        _room_trending_cache = (time.time() + _ROOM_TRENDING_TTL_S, songs)
+    return songs
+
+
+@app.route("/room-suggestions")
+def room_suggestions():
+    """Backs the phone Home screen's "Trending now" / "For your group"
+    rows. "For your group" is deliberately just "already fast to play in
+    this household's library" (status=ready), not a recommendation engine."""
+    trending = _get_trending_songs()
+    group_picks = [
+        {
+            "artist": song["artist"],
+            "title": song["title"],
+            "album": song.get("album"),
+            "cover_art": song.get("cover_art") or "",
+            "duration_seconds": song.get("duration_seconds"),
+            "ytmusic_video_id": None,
+        }
+        for song in song_library.list_songs(status=library.STATUS_READY, limit=ROOM_GROUP_PICKS_LIMIT)
+    ]
+    return jsonify({"trending": trending, "group_picks": group_picks})
+
+
+@app.route("/room/create", methods=["POST"])
+def create_room():
+    """Called by the TV lobby on boot. Returns a fresh room code; the TV
+    then opens /room-ws with {"role": "tv", "action": "host", "code": ...}
+    to actually attach to it - creating the room and attaching to it are
+    separate steps so the TV can render the QR code immediately without
+    waiting on a WebSocket round trip."""
+    room = room_registry.create_room()
+    return jsonify({"code": room.code})
+
+
+@app.route("/room/<code>/state")
+def room_state(code):
+    """Debug/fallback JSON snapshot of a room's state - the real-time path
+    is /room-ws; this exists for tests and for a phone that's mid-reconnect."""
+    state = room_registry.room_state(code.strip().upper())
+    if state is None:
+        return jsonify({"error": "unknown room code"}), 404
+    return jsonify(state)
+
+
+@app.route("/room/<code>/qr.svg")
+def room_qr(code):
+    """SVG QR code whose payload is a LAN-reachable /join/<code> URL - the
+    TV lobby's fixed, no-typing-needed join code. See _detect_lan_ip()."""
+    code = code.strip().upper()
+    if room_registry.get_room(code) is None:
+        return Response("unknown room code", status=404, mimetype="text/plain")
+
+    _, app_port = _resolve_host_port()
+    join_url = f"http://{_detect_lan_ip()}:{app_port}/join/{code}"
+    return Response(qr_svg(join_url), mimetype="image/svg+xml")
+
+
+@app.route("/join/<code>")
+def join_room(code):
+    """Landing page a phone opens after scanning the TV's QR code - the
+    wireframe's Screen 2 is the OS camera viewfinder itself, so there is no
+    in-app scanning step; this route IS what the QR code points at. Once
+    joined, static/phone/join.js navigates on to /room/<code>."""
+    code = code.strip().upper()
+    return render_template("phone_join.html", code=code, room_exists=room_registry.get_room(code) is not None)
+
+
+@app.route("/room/<code>")
+def phone_home(code):
+    """The phone's post-join app shell (Home/Search/Queue) - a fresh page
+    load rather than a client-side handoff from /join/<code>, so it opens
+    its own /room-ws connection cleanly."""
+    code = code.strip().upper()
+    if room_registry.get_room(code) is None:
+        return render_template("phone_join.html", code=code, room_exists=False)
+    return render_template("phone_home.html", code=code)
+
+
+@app.route("/room/<code>/now-singing")
+def phone_now_singing(code):
+    """The phone's synced-lyrics + remote-control screen (wireframe Screen
+    5) - its own page/socket, same pattern as phone_home above, so a phone
+    can navigate here from the Home screen's now-playing banner without
+    losing anything (a fresh /room-ws join just re-syncs from the room's
+    current now_playing via its room-snapshot)."""
+    code = code.strip().upper()
+    if room_registry.get_room(code) is None:
+        return render_template("phone_join.html", code=code, room_exists=False)
+    return render_template("phone_now_singing.html", code=code)
+
+
+def _handle_tv_message(code, payload):
+    msg_type = payload.get("type")
+    try:
+        if msg_type == "now-playing-resolved":
+            room_registry.set_now_playing_resolved(code, payload.get("resolved"))
+        elif msg_type == "playback-position":
+            room_registry.set_now_playing_position(code, float(payload.get("pos_ms", 0)), bool(payload.get("playing", True)))
+        elif msg_type == "advance-queue":
+            room_registry.advance_queue(code)
+    except (TypeError, ValueError):
+        # Malformed frame - drop it and keep the connection alive, matching
+        # /grade's tolerance for garbage sync frames.
+        pass
+
+
+def _handle_phone_message(code, phone_id, payload):
+    msg_type = payload.get("type")
+    try:
+        if msg_type == "enqueue-song":
+            room_registry.enqueue_song(code, payload.get("song") or {}, phone_id)
+        elif msg_type == "playback-control":
+            room_registry.route_playback_control(code, payload.get("action"), payload.get("entry_id"))
+        elif msg_type == "voice-assist-volume":
+            room_registry.set_voice_assist_volume(code, float(payload.get("volume", 0)))
+        elif msg_type == "score-update":
+            score_payload = {k: v for k, v in payload.items() if k != "type"}
+            room_registry.route_score_update(code, phone_id, score_payload)
+    except (TypeError, ValueError):
+        pass
+
+
+@sock.route("/room-ws")
+def room_ws(ws):
+    """Single realtime endpoint for the TV+phone room-pairing feature (see
+    core/rooms.py's module docstring for the design). The first text frame
+    declares the connection's role and the room it's joining/hosting:
+
+      TV:    {"role": "tv", "action": "host", "code": "<from /room/create>"}
+      Phone: {"role": "phone", "action": "join", "code": "4K2P", "name": "Dave"}
+
+    Every message after that is a {"type": ...} frame routed by
+    _handle_tv_message/_handle_phone_message to the matching RoomRegistry
+    method - see core/rooms.py for what each type does. Mirrors /grade's
+    handshake-then-loop shape above.
+    """
+    role = None
+    code = None
+    phone_id = None
+    conn = None
+    try:
+        handshake_raw = ws.receive()
+        if handshake_raw is None:
+            return
+
+        try:
+            handshake = json.loads(handshake_raw)
+            role = handshake["role"]
+            code = str(handshake["code"]).strip().upper()
+            if role not in ("tv", "phone") or not code:
+                raise ValueError("bad handshake")
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            ws.send(json.dumps({"error": 'First message must be JSON {"role": "tv"|"phone", "code": <room code>}'}))
+            role = None
+            return
+
+        conn = rooms.Connection(role, ws.send)
+        if role == "tv":
+            room = room_registry.attach_tv(code, conn)
+        else:
+            room, phone_id = room_registry.join_phone(code, conn, handshake.get("name"))
+
+        if room is None:
+            ws.send(json.dumps({"error": f"unknown room code {code}"}))
+            return
+
+        while True:
+            message = ws.receive()
+            if message is None:
+                break
+            try:
+                payload = json.loads(message)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if role == "tv":
+                _handle_tv_message(code, payload)
+            else:
+                _handle_phone_message(code, phone_id, payload)
+    except ConnectionClosed:
+        pass
+    finally:
+        if role == "tv" and conn is not None:
+            room_registry.detach_tv(code, conn=conn)
+        elif role == "phone" and code and phone_id:
+            room_registry.leave_phone(code, phone_id)
 
 
 @app.route("/lyrics")

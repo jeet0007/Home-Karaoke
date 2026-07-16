@@ -177,13 +177,13 @@ class UnifiedSearchRouteTestCase(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 502)
 
-    def test_home_page_renders(self):
+    def test_home_page_redirects_to_tv_lobby(self):
+        # The single-device search/library home page was retired in favor
+        # of the TV+phone room-pairing flow - see tests/test_room_http_routes.py
+        # for the /tv route itself.
         resp = self.client.get("/")
-        self.assertEqual(resp.status_code, 200)
-        # The search wiring itself now lives in static/index/search.js, not
-        # inlined in the template - this just confirms the page loads it as
-        # a module.
-        self.assertIn(b'<script type="module" src="/static/index/main.js">', resp.data)
+        self.assertEqual(resp.status_code, 302)
+        self.assertTrue(resp.headers["Location"].endswith("/tv"))
 
 
 if __name__ == "__main__":
