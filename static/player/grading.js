@@ -49,6 +49,17 @@ let mainThreadGrader = null; // only set for the ScriptProcessorNode+WASM backen
 // stopGrading() know how to route/tear down.
 let gradingBackend = null;
 
+// Where the mic's song-position clock comes from, and how updates are
+// surfaced beyond this module's own score display - injectable via
+// ensureGradingStarted(options) so a phone (no local <audio>, no local
+// playback state) can drive grading from a RemoteClock extrapolating the
+// TV's playback-position broadcasts (static/shared/clock.js) and forward
+// its own scores back to the TV, instead of this module's original
+// TV-only assumptions. Defaults preserve the exact original behavior.
+let getPositionMs = effectiveLyricMs;
+let isAudioPlaying = () => !audio.paused;
+let onScoreUpdate = null;
+
 function setScoreDisplay(text) {
   if (scoreValueEl) scoreValueEl.textContent = text;
 }
@@ -59,6 +70,7 @@ function renderScoreUpdate(update) {
   if (update.frequency_hz) {
     setLivePitch(update.frequency_hz);
   }
+  if (onScoreUpdate) onScoreUpdate(update);
 }
 
 // Position syncs map the mic stream's clock onto song time (client-side
@@ -71,7 +83,7 @@ const POSITION_SYNC_INTERVAL_MS = 1000;
 let positionSyncIntervalId = null;
 
 export function sendPositionSync() {
-  const posMs = effectiveLyricMs();
+  const posMs = getPositionMs();
   if (gradingBackend === 'worklet' && gradingProcessorNode) {
     gradingProcessorNode.port.postMessage({ pos_ms: posMs });
   } else if (gradingBackend === 'scriptprocessor-wasm' && mainThreadGrader) {
@@ -86,7 +98,7 @@ export function sendPositionSync() {
 function startPositionSyncs() {
   if (positionSyncIntervalId !== null) return;
   positionSyncIntervalId = setInterval(() => {
-    if (!audio.paused) sendPositionSync();
+    if (isAudioPlaying()) sendPositionSync();
   }, POSITION_SYNC_INTERVAL_MS);
 }
 
@@ -131,6 +143,9 @@ export function stopGrading() {
   }
   gradingBackend = null;
   setScoreDisplay('★ --');
+  getPositionMs = effectiveLyricMs;
+  isAudioPlaying = () => !audio.paused;
+  onScoreUpdate = null;
 }
 
 // -- Backend 1: AudioWorklet + WASM (preferred) --------------------------
@@ -249,9 +264,18 @@ async function attachWebSocketGrading(audioContext, source, silentGain, melodyNo
   gradingProcessorNode = processor;
 }
 
-export async function ensureGradingStarted() {
+// `options.getPositionMs`/`options.isPlaying` override where the mic's
+// song-position clock and play/pause state come from (both default to the
+// TV's own <audio> element); `options.onScoreUpdate(update)` is called
+// alongside this module's own score display for every update, letting a
+// caller forward scores elsewhere (e.g. a phone relaying them to the TV
+// over /room-ws - see static/phone/now-singing.js).
+export async function ensureGradingStarted(options = {}) {
   if (gradingStarted) return;
   gradingStarted = true;
+  if (options.getPositionMs) getPositionMs = options.getPositionMs;
+  if (options.isPlaying) isAudioPlaying = options.isPlaying;
+  if (options.onScoreUpdate) onScoreUpdate = options.onScoreUpdate;
 
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.WebSocket) {
     return;

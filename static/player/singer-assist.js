@@ -103,6 +103,21 @@ volumeSlider.addEventListener('input', () => {
   singerAudio.volume = Number(volumeSlider.value);
 });
 
+// Called by static/player/room-broadcast.js when a phone's voice-assist
+// blend slider changes (see core/rooms.py's set_voice_assist_volume) - the
+// TV keeps its own on-screen slider in sync rather than hiding it, since
+// either device can adjust the blend. A nonzero remote volume also turns
+// the stem on if it wasn't already - the singer moving the slider clearly
+// wants to hear some of it, and toggling it on manually first would be a
+// pointless extra step for the one control this feature actually exposes
+// remotely.
+export function setVolumeRemote(volume) {
+  const clamped = Math.max(0, Math.min(1, Number(volume)));
+  volumeSlider.value = String(clamped);
+  singerAudio.volume = clamped;
+  if (clamped > 0 && !enabled) enable();
+}
+
 mainAudio.addEventListener('play', () => {
   if (!enabled) return;
   syncTime();

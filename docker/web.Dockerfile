@@ -9,7 +9,7 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     APP_HOST=0.0.0.0 \
-    APP_PORT=5000
+    APP_PORT=3000
 
 WORKDIR /app
 
@@ -22,7 +22,7 @@ COPY . /app
 # imports vocal_transcribe/tempo's heavy deps (they're lazy-imported inside
 # their own functions, which this container's code path never calls).
 
-EXPOSE 5000
+EXPOSE 3000
 
 # debug=False (see app.py's FLASK_DEBUG check): no reloader, and critically,
 # no queue worker - see the docstring on start_library_worker() and

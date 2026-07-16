@@ -12,6 +12,7 @@ ytmusicapi==1.7.4
 flask-sock>=0.7.0
 simple-websocket>=1.1.0
 numpy>=1.26
+qrcode>=8.0
 
 # Optional: the isolated-vocal note guide (Demucs + Basic Pitch) lives in
 # requirements-ml.txt - heavy (torch), opt-in. Without it there's no note
